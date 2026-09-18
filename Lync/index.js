@@ -731,7 +731,8 @@ async function changedJson() {
 		PROJECT_JSON,
 		path.relative(process.cwd(), path.resolve(PROJECT_JSON, '../sourcemap.json')).replace(/\\/g, '/'),
 		'*.lock',
-		'.git/*',
+		'.git',
+		'.git/**',
 		'~$*'
 	]
 	if (projectJson.globIgnorePaths)
@@ -951,6 +952,7 @@ async function fetchSources() {
 		// Sync file changes
 		chokidar.watch('.', {
 			cwd: process.cwd(),
+			ignored: hasFileJobs ? undefined : localPathIsIgnored,
 			disableGlobbing: true,
 			ignoreInitial: true,
 			persistent: true,
