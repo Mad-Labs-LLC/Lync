@@ -950,6 +950,7 @@ async function fetchSources() {
 		}
 
 		// Sync file changes
+		const hasFileJobs = (projectJson.jobs || []).some(job => job.on.some(event => event != 'start'))
 		chokidar.watch('.', {
 			cwd: process.cwd(),
 			ignored: hasFileJobs ? undefined : localPathIsIgnored,
