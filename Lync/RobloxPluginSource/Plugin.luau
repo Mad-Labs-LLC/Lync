@@ -33,6 +33,7 @@ const ChangeHistoryService = game:GetService("ChangeHistoryService")
 const CollectionService = game:GetService("CollectionService")
 const HttpService = game:GetService("HttpService")
 const PhysicsService = game:GetService("PhysicsService")
+const Players = game:GetService("Players")
 const RunService = game:GetService("RunService")
 const ScriptEditorService = game:GetService("ScriptEditorService")
 const Selection = game:GetService("Selection")
@@ -45,6 +46,8 @@ const TweenService = game:GetService("TweenService")
 
 -- Constants
 const IS_PLAYTEST_SERVER = if RunService:IsRunning() then "true" else nil
+const TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE = 500 -- Team Create sessions cap plugin HttpService calls at this rate; local edit sessions are uncapped
+const SYNC_REQUEST_TYPES = {Lua = true, Model = true, JSON = true, YAML = true, TOML = true, Excel = true, JsonModel = true, PlainText = true, Localization = true}
 const SUPPRESSED_CLASSES = {
 	"Terrain";
 	"StarterCharacterScripts";
@@ -127,6 +130,35 @@ const unsavedFilesFrame = widgetFrame.UnsavedFiles
 
 function getHost(): string
 	return "http://localhost:" .. (portTextBox.Text ~= "" and portTextBox.Text or portTextBox.PlaceholderText)
+end
+
+-- Team Create sessions expose the connected editors as Players in the edit DataModel; a local edit session has no LocalPlayer
+function isTeamCreateSession(): boolean
+	return not RunService:IsRunning() and Players.LocalPlayer ~= nil
+end
+
+-- Number of HTTP requests a full sync of this tree makes: one per file-backed entry plus one for a terrain region
+function countSyncRequests(tree: any): number
+	local count = 0
+	for _, data in tree do
+		if SYNC_REQUEST_TYPES[data.Type] then count += 1 end
+		if data.TerrainRegion then count += 1 end
+	end
+	return count
+end
+
+-- Team Create sessions cap plugin HttpService calls at TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE and a sync spends one per file, so a full sync of a
+-- large project would silently lose every file past the cap after $clearOnSync had already emptied the containers. Warn in any Team Create
+-- session and refuse the sync outright when the project cannot fit inside the cap.
+function blocksTeamCreateSync(tree: any): boolean
+	if IS_PLAYTEST_SERVER or not isTeamCreateSession() then return false end
+	const syncRequests = countSyncRequests(tree)
+	if syncRequests > TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE then
+		task.spawn(error, `[Lync] - Refusing to sync into a Team Create place: a full sync of this project makes {syncRequests} HTTP requests, but Team Create sessions allow plugins only {TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE} per minute, so the place would be emptied and most files lost. Turn off Team Create (Game Settings > Security), reopen the place and reconnect.`, 0)
+		return true
+	end
+	warn(`[Lync] - Team Create is enabled in this place. Team Create sessions cap plugin HTTP requests at {TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE} per minute and a full sync of this project makes {syncRequests}, so it fits, but a bigger project would lose files.`)
+	return false
 end
 
 function connectButtonColors(button: TextButton): ()
@@ -1097,7 +1129,7 @@ function setConnected(newConnected: boolean)
 					return HttpService:JSONDecode(HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER}))
 				end)
 				if success then
-					if result.info.Version == VERSION then
+					if result.info.Version == VERSION and not blocksTeamCreateSync(result.tree) then
 						map = result
 						if not IS_PLAYTEST_SERVER then
 							if result.info.Debug then warn("[Lync] - Map:", result) end
@@ -1109,7 +1141,9 @@ function setConnected(newConnected: boolean)
 							table.clear(scheduledAfterSync)
 						end
 					else
-						task.spawn(error, `[Lync] - Version mismatch ({result.info.Version} ~= {VERSION}). Please restart Studio`)
+						if result.info.Version ~= VERSION then
+							task.spawn(error, `[Lync] - Version mismatch ({result.info.Version} ~= {VERSION}). Please restart Studio`)
+						end
 						newConnected = false
 					end
 				else
