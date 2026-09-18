@@ -61,7 +61,7 @@ try {
 		GithubAccessToken: '',
 		AutoUpdate: false,
 		AutoUpdate_UsePrereleases: false,
-		AutoUpdate_Repo: 'Iron-Stag-Games/Lync',
+		AutoUpdate_Repo: 'Mad-Labs-LLC/Lync',
 		AutoUpdate_LatestId: 0,
 		Path_RobloxPlugins: '',
 		JobCommands: {}
