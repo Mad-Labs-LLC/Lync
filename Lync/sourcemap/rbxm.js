@@ -31,15 +31,6 @@ function readUTF8(bytes) {
 /**
  * @returns {number}
  */
-function readUInt8() {
-	const read = buf.readUInt8(start)
-	start += 1
-	return read
-}
-
-/**
- * @returns {number}
- */
 function readUInt32LE() {
 	const read = buf.readUInt32LE(start)
 	start += 4
@@ -47,52 +38,25 @@ function readUInt32LE() {
 }
 
 /**
- * @param {number} value
- * @returns {number}
- */
-function untransform_i32(value) {
-	if (value % 2 == 0) {
-		return value / 2
-	} else {
-		return -(value + 1) / 2
-	}
-}
-
-/**
- * @param {Int32Array} arr
- * @returns {Buffer}
- */
-function read_interleaved_i32_array(arr) {
-	const output = Buffer.alloc(arr.length)
-	const len = arr.length / 4
-	for (let i = 0; i < len; i++) {
-		const buf = Buffer.from([ arr[i], arr[i + len], arr[i + len * 2], arr[i + len * 3] ])
-		const untransformed = untransform_i32(buf.readInt32BE())
-		output.writeInt32LE(untransformed, i * 4)
-	}
-	return output
-}
-
-/**
+ * Referent arrays are stored as byte-interleaved, zigzag-transformed, delta-encoded big-endian i32s.
  * @param {number} length
  * @returns {number[]}
  */
 function readReferentArray(length) {
-	const output = []
+	const arr = readBytes(length * 4)
+	const output = new Array(length)
 	let referent = 0
-	let referentStart = 0
-	const referentArr = read_interleaved_i32_array(readBytes(length * 4))
 	for (let i = 0; i < length; i++) {
-		referent += referentArr.readInt32LE(referentStart)
-		output.push(referent)
-		referentStart += 4
+		const transformed = ((arr[i] << 24) | (arr[i + length] << 16) | (arr[i + length * 2] << 8) | arr[i + length * 3]) >>> 0
+		referent += (transformed >>> 1) ^ -(transformed & 1)
+		output[i] = referent
 	}
 	return output
 }
 
 /**
  * @param {any} target
- * @param {any[]} instances
+ * @param {Map<number, any>} instances
  * @param {any} rbxm
  */
 function recurse(target, instances, rbxm) {
@@ -100,7 +64,7 @@ function recurse(target, instances, rbxm) {
 
 	for (const childReferent of rbxm.children) {
 		let nextTarget = target
-		const rbxmChild = instances[childReferent]
+		const rbxmChild = instances.get(childReferent)
 		const name = rbxmChild.name
 		const className = rbxmChild.className
 
@@ -133,36 +97,31 @@ function recurse(target, instances, rbxm) {
  * @param {Buffer} fileRead
  */
 module.exports.fill = function(target, fileRead) {
-	const instances = {}
+	/** Referent -> instance */
+	const instances = new Map()
+	/** Class ID -> instances in INST-chunk order, which is the order PROP chunks list their values in */
+	const classInstances = new Map()
 
 	buf = fileRead
 	start = 0
 
-	start += 32 //const header = readBytes(32)
-	//console.log('header:', header)
+	start += 32 // header
 	while (start < fileRead.length) {
 		const chunkName = readUTF8(4)
 		const compressedLength = readUInt32LE()
 		const uncompressedLength = readUInt32LE()
-		start += 4 //const reserved = readBytes(4)
-		//console.log('chunkName:', chunkName)
-		//console.log('\tcompressedLength:', compressedLength)
-		//console.log('\tuncompressedLength:', uncompressedLength)
-		//console.log('\treserved:', reserved)
+		start += 4 // reserved
 
 		let chunkData;
 		if (compressedLength == 0) {
 			chunkData = readBytes(uncompressedLength)
-			//console.log('\tchunkData (uncompressed):', chunkData)
 		} else {
 			const magicNumber = buf.subarray(start, start + 4)
 			if (magicNumber.equals(Buffer.from([ 0x28, 0xb5, 0x2f, 0xfd ]))) {
-				chunkData = ZSTD.decompress(readBytes(compressedLength))
-				//console.log('\tchunkData (ZSTD):', chunkData)
+				chunkData = Buffer.from(ZSTD.decompress(readBytes(compressedLength)))
 			} else {
 				chunkData = Buffer.alloc(uncompressedLength)
 				LZ4.decompressBlock(readBytes(compressedLength), chunkData, 0, compressedLength, 0)
-				//console.log('\tchunkData (LZ4):', chunkData)
 			}
 		}
 
@@ -172,76 +131,44 @@ module.exports.fill = function(target, fileRead) {
 
 		if (chunkName == 'INST') {
 			const classId = readUInt32LE()
-			const classNameLength = readUInt32LE(4)
+			const classNameLength = readUInt32LE()
 			const className = readUTF8(classNameLength)
-			start += 1 //const objectFormat = readUInt8()
+			start += 1 // objectFormat
 			const instanceCount = readUInt32LE()
 			const referents = readReferentArray(instanceCount)
-			//console.log('\t\tclassId:', classId)
-			//console.log('\t\tclassNameLength:', classNameLength)
-			//console.log('\t\tclassName:', className)
-			//console.log('\t\tobjectFormat:', objectFormat)
-			//console.log('\t\tinstanceCount:', instanceCount)
-			//console.log('\t\tinstanceCount:', instanceCount)
-			//console.log('\t\treferents:', referents)
+			const list = classInstances.get(classId) ?? []
 			for (const referent of referents) {
-				instances[referent] = {
+				const instance = {
 					classId: classId,
 					className: className,
 					name: '',
 					parent: -1,
 					children: []
 				}
+				instances.set(referent, instance)
+				list.push(instance)
 			}
+			if (!classInstances.has(classId)) classInstances.set(classId, list)
 		} else if (chunkName == 'PROP') {
 			const classId = readUInt32LE()
-			const propertyNameLength = readUInt32LE(4)
+			const propertyNameLength = readUInt32LE()
 			const propertyName = readUTF8(propertyNameLength)
-			start += 1 //const typeId = readUInt8()
-			//console.log('\t\tclassId:', classId)
-			//console.log('\t\tpropertyNameLength:', propertyNameLength)
-			//console.log('\t\tpropertyName:', propertyName)
-			//console.log('\t\ttypeId:', typeId)
+			start += 1 // typeId
 			if (propertyName == 'Name') {
-				let numInstances = 0
-				for (const referent in instances) {
-					const instance = instances[referent]
-					if (instance.classId == classId) {
-						numInstances += 1
-					}
-				}
-				//console.log('\t\t\tnumInstances:', numInstances)
-				for (let index = 0; index < numInstances; index++) {
+				for (const instance of classInstances.get(classId) ?? []) {
 					const stringLength = readUInt32LE()
-					const string = readUTF8(stringLength)
-					//console.log('\t\t\tstringLength:', stringLength)
-					//console.log('\t\t\tstring:', string)
-					let nextIndex = 0
-					for (const referent in instances) {
-						const instance = instances[referent]
-						if (instance.classId == classId) {
-							if (index == nextIndex) {
-								instance.name = string
-								break
-							}
-							nextIndex += 1
-						}
-					}
+					instance.name = readUTF8(stringLength)
 				}
 			}
 		} else if (chunkName == 'PRNT') {
-			start += 1 //const version = readUInt8()
+			start += 1 // version
 			const instanceCount = readUInt32LE()
 			const childReferents = readReferentArray(instanceCount)
 			const parentReferents = readReferentArray(instanceCount)
-			//console.log('\t\tversion:', version)
-			//console.log('\t\tinstanceCount:', instanceCount)
-			//console.log('\t\tchildReferents:', childReferents)
-			//console.log('\t\tparentReferents:', parentReferents)
 			for (let index = 0; index < instanceCount; index++) {
-				instances[childReferents[index]].parent = parentReferents[index]
+				instances.get(childReferents[index]).parent = parentReferents[index]
 				if (parentReferents[index] >= 0)
-					instances[parentReferents[index]].children.push(childReferents[index])
+					instances.get(parentReferents[index]).children.push(childReferents[index])
 			}
 		}
 
@@ -249,15 +176,10 @@ module.exports.fill = function(target, fileRead) {
 		start = prevStart
 	}
 
-	//console.log(instances)
-
-	for (const referent in instances) {
-		const instance = instances[referent]
+	for (const instance of instances.values()) {
 		if (instance.parent == -1) {
 			recurse(target, instances, instance)
 			break
 		}
 	}
-
-	//console.log(target)
 }
