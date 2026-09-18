@@ -95,6 +95,18 @@ local map: {
 	tree: any;
 };
 local activeSourceRequests = 0
+-- Studio caps all plugins in a Studio process to one shared pool of HttpService requests: 500 per rolling 60 seconds (measured 2026-09-18).
+-- Requests past the cap fail instantly with "Number of requests exceeded limit", so an unpaced first sync of a large project loses every
+-- file after the 500th. All traffic to the Lync server goes through lyncGet/lyncRequest, which queue callers FIFO and release them at
+-- HTTP_REQUESTS_PER_MINUTE, leaving part of the pool for other plugins. Hitting the cap anyway pauses the queue and retries.
+local HTTP_REQUESTS_PER_MINUTE = 450
+local HTTP_WINDOW_SECONDS = 60
+local HTTP_LIMIT_ERROR = "Number of requests exceeded limit"
+local HTTP_LIMIT_PENALTY_SECONDS = 5
+local HTTP_LIMIT_MAX_RETRIES = 30
+local httpSentTimes: {number} = {}
+local httpWaiting: {thread} = {}
+local httpPenaltyUntil = 0
 const updatingSource: {[LuaSourceContainer]: true?} = setmetatable({}, {__mode = "k"}) :: any
 const tagsChangedLocks: {[Instance]: true?} = setmetatable({}, {__mode = "k"}) :: any
 const changedFiles: {[Instance]: boolean?} = setmetatable({}, {__mode = "k"}) :: any
@@ -128,6 +140,84 @@ const unsavedFilesFrame = widgetFrame.UnsavedFiles
 function getHost(): string
 	return "http://localhost:" .. (portTextBox.Text ~= "" and portTextBox.Text or portTextBox.PlaceholderText)
 end
+
+function pruneHttpWindow(): ()
+	local cutoff = os.clock() - HTTP_WINDOW_SECONDS
+	while httpSentTimes[1] and httpSentTimes[1] < cutoff do
+		table.remove(httpSentTimes, 1)
+	end
+end
+
+function httpSlotAvailable(): boolean
+	pruneHttpWindow()
+	return os.clock() >= httpPenaltyUntil and #httpSentTimes < HTTP_REQUESTS_PER_MINUTE
+end
+
+function waitForHttpSlot(): ()
+	if #httpWaiting == 0 and httpSlotAvailable() then
+		table.insert(httpSentTimes, os.clock())
+		return
+	end
+	table.insert(httpWaiting, coroutine.running())
+	coroutine.yield()
+end
+
+function onHttpLimitHit(): ()
+	-- Studio says the shared pool is empty: treat our window as full so slots only free up as real requests age out, then pause briefly
+	while #httpSentTimes < HTTP_REQUESTS_PER_MINUTE do
+		table.insert(httpSentTimes, os.clock())
+	end
+	httpPenaltyUntil = math.max(httpPenaltyUntil, os.clock() + HTTP_LIMIT_PENALTY_SECONDS)
+end
+
+function isHttpLimitError(err: any): boolean
+	return string.find(tostring(err), HTTP_LIMIT_ERROR, 1, true) ~= nil
+end
+
+-- Rate limited HttpService:GetAsync against the Lync server. Retries while Studio reports the request budget exceeded; any other error propagates unchanged.
+function lyncGet(headers: {[string]: any}): string
+	local attempts = 0
+	while true do
+		waitForHttpSlot()
+		local success, result = pcall(HttpService.GetAsync, HttpService, getHost(), false, headers)
+		if success then
+			return result
+		elseif isHttpLimitError(result) and attempts < HTTP_LIMIT_MAX_RETRIES then
+			attempts += 1
+			onHttpLimitHit()
+		else
+			error(result, 0)
+		end
+	end
+end
+
+-- Rate limited HttpService:RequestAsync with the same retry behaviour as lyncGet
+function lyncRequest(options: {[string]: any}): any
+	local attempts = 0
+	while true do
+		waitForHttpSlot()
+		local success, result = pcall(HttpService.RequestAsync, HttpService, options)
+		if success then
+			return result
+		elseif isHttpLimitError(result) and attempts < HTTP_LIMIT_MAX_RETRIES then
+			attempts += 1
+			onHttpLimitHit()
+		else
+			error(result, 0)
+		end
+	end
+end
+
+-- Releases queued requests in order as the rolling window frees up
+task.spawn(function(): ()
+	while true do
+		task.wait(0.05)
+		while httpWaiting[1] and httpSlotAvailable() do
+			table.insert(httpSentTimes, os.clock())
+			task.spawn(table.remove(httpWaiting, 1) :: thread)
+		end
+	end
+end)
 
 function connectButtonColors(button: TextButton): ()
 	button.MouseEnter:Connect(function()
@@ -304,7 +394,7 @@ function addChangedFileEntry(object: (Instance | "CollisionGroupData"), path: st
 							const data = map.tree[path]
 							const success, result = pcall(function()
 								if data.Type == "Lua" then
-									const source = HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+									const source = lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 									setScriptSourceLive(data.Instance, source)
 								elseif data.Type == "Model" then
 									buildPath(path)
@@ -359,9 +449,9 @@ function addChangedFileEntry(object: (Instance | "CollisionGroupData"), path: st
 							const data = map.tree[path]
 							const success, result = pcall(function()
 								if data.Type == "Lua" then
-									HttpService:RequestAsync({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = ScriptEditorService:GetEditorSource(data.Instance), Compress = Enum.HttpCompression.None})
+									lyncRequest({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = ScriptEditorService:GetEditorSource(data.Instance), Compress = Enum.HttpCompression.None})
 								elseif data.Type == "Model" then
-									HttpService:RequestAsync({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = buffer.tostring(SerializationService:SerializeInstancesAsync({object})), Compress = Enum.HttpCompression.None})
+									lyncRequest({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = buffer.tostring(SerializationService:SerializeInstancesAsync({object})), Compress = Enum.HttpCompression.None})
 								end
 							end)
 							if success then
@@ -373,7 +463,7 @@ function addChangedFileEntry(object: (Instance | "CollisionGroupData"), path: st
 						elseif object == "CollisionGroupData" then
 							const currentCollisionGroups = getCurrentCollisionGroups()
 							const success, result = pcall(function()
-								HttpService:RequestAsync({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = map.info.CollisionGroupsFile}, Body = HttpService:JSONEncode(currentCollisionGroups), Compress = Enum.HttpCompression.None})
+								lyncRequest({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = map.info.CollisionGroupsFile}, Body = HttpService:JSONEncode(currentCollisionGroups), Compress = Enum.HttpCompression.None})
 							end)
 							if success then
 								map.info.CollisionGroups = currentCollisionGroups
@@ -883,7 +973,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -898,7 +988,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -928,7 +1018,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -943,7 +1033,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -974,7 +1064,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -995,7 +1085,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -1017,7 +1107,7 @@ function buildPath(path: string): ()
 				task.spawn(function(): ()
 					activeSourceRequests += 1
 					const success, result = pcall(function()
-						return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.TerrainRegion[1], DataType = data.Type})
+						return lyncGet({Key = serverKey, Type = "Source", Path = data.TerrainRegion[1], DataType = data.Type})
 					end)
 					activeSourceRequests -= 1
 					if success then
@@ -1094,7 +1184,7 @@ function setConnected(newConnected: boolean)
 		if newConnected then
 			if not map then
 				const success, result = pcall(function()
-					return HttpService:JSONDecode(HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER}))
+					return HttpService:JSONDecode(lyncGet({Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER}))
 				end)
 				if success then
 					if result.info.Version == VERSION then
@@ -1102,6 +1192,9 @@ function setConnected(newConnected: boolean)
 						if not IS_PLAYTEST_SERVER then
 							if result.info.Debug then warn("[Lync] - Map:", result) end
 							task.spawn(buildAll)
+							if activeSourceRequests > HTTP_REQUESTS_PER_MINUTE then
+								print(`[Lync] - Fetching {activeSourceRequests} files. Studio allows plugins {HTTP_REQUESTS_PER_MINUTE} HTTP requests per minute, so this sync will take about {math.ceil(activeSourceRequests / HTTP_REQUESTS_PER_MINUTE * HTTP_WINDOW_SECONDS)} seconds`)
+							end
 							repeat task.wait() until activeSourceRequests == 0
 							for _, scheduled in scheduledAfterSync do
 								task.spawn(scheduled.Func, unpack(scheduled.Args))
@@ -1118,7 +1211,7 @@ function setConnected(newConnected: boolean)
 				end
 			else
 				const success, result = pcall(function()
-					HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Resume"})
+					lyncGet({Key = serverKey, Type = "Resume"})
 				end)
 				if not success then
 					task.spawn(error, "[Lync] - " .. result)
@@ -1341,7 +1434,7 @@ end)
 while task.wait(0.5) do
 	if connected then
 		const success, result = pcall(function()
-			const get = HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Modified", Playtest = IS_PLAYTEST_SERVER})
+			const get = lyncGet({Key = serverKey, Type = "Modified", Playtest = IS_PLAYTEST_SERVER})
 			return get ~= "{}" and HttpService:JSONDecode(get) or nil
 		end)
 		if success then
