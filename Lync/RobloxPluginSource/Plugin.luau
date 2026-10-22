@@ -615,6 +615,69 @@ function makeDirty(object: Instance, property: string): ()
 	end
 end
 
+-- Studio-only: watches a synced object so edits made in Studio show up in the unsaved files list. Lune builds stub this out.
+function listenForChanges(target: any, data: any): ()
+	tagsChangedLocks[target] = true
+	RunService.Heartbeat:Once(function(): ()
+		RunService.Heartbeat:Wait() -- this is goofy
+		tagsChangedLocks[target] = nil
+	end)
+
+	if changedFiles[target] == nil then
+		const mapType = data.Type
+
+		-- Modification events
+		if mapType == "Lua" then
+			(target :: LuaSourceContainer):GetPropertyChangedSignal("Source"):Connect(function(): ()
+				if updatingSource[target] then
+					updatingSource[target] = nil
+				else
+					makeDirty(target, "Source")
+				end
+			end)
+
+		elseif mapType == "Model" then
+			target.Changed:Connect(function(property: string): ()
+				if property ~= "Parent" then
+					makeDirty(target, property)
+				end
+			end)
+			target.AttributeChanged:Connect(function(attribute: string): ()
+				makeDirty(target, "AttributeChanged")
+			end)
+			target.DescendantAdded:Connect(function(descendant: Instance): ()
+				makeDirty(target, "DescendantAdded")
+				descendant.Changed:Connect(function(property: string)
+					makeDirty(target, property)
+				end)
+				descendant.AttributeChanged:Connect(function(attribute: string): ()
+					makeDirty(target, "AttributeChanged")
+				end)
+			end)
+			for _, descendant in target:GetDescendants() do
+				descendant.Changed:Connect(function(property: string): ()
+					makeDirty(target, property)
+				end)
+				descendant.AttributeChanged:Connect(function(attribute: string): ()
+					makeDirty(target, "AttributeChanged")
+				end)
+			end
+		end
+
+		-- Clear on destruction
+		target.Destroying:Connect(function()
+			changedFiles[target] = nil
+			updateChangedFilesUI()
+		end)
+
+		changedFiles[target] = false
+	end
+end
+
+-- Everything between the offline markers is also run by `lync build` inside Lune (see luneBuildTemplate.luau), so it must only touch
+-- Instances, the map, and the helpers the template provides. Keep Studio-only APIs (signals, plugin, UI, services) outside the markers.
+--offline-start
+
 function scheduleAfterSync(func: () -> (), ...: any): ()
 	table.insert(scheduledAfterSync, {Func = func, Args = {...}})
 end
@@ -772,62 +835,7 @@ end
 function finishBuild(target: any, data: any): ()
 	data.Instance = target
 	setDetails(target, data)
-
-	tagsChangedLocks[target] = true
-	RunService.Heartbeat:Once(function(): ()
-		RunService.Heartbeat:Wait() -- this is goofy
-		tagsChangedLocks[target] = nil
-	end)
-
-	if changedFiles[target] == nil then
-		const mapType = data.Type
-
-		-- Modification events
-		if mapType == "Lua" then
-			(target :: LuaSourceContainer):GetPropertyChangedSignal("Source"):Connect(function(): ()
-				if updatingSource[target] then
-					updatingSource[target] = nil
-				else
-					makeDirty(target, "Source")
-				end
-			end)
-
-		elseif mapType == "Model" then
-			target.Changed:Connect(function(property: string): ()
-				if property ~= "Parent" then
-					makeDirty(target, property)
-				end
-			end)
-			target.AttributeChanged:Connect(function(attribute: string): ()
-				makeDirty(target, "AttributeChanged")
-			end)
-			target.DescendantAdded:Connect(function(descendant: Instance): ()
-				makeDirty(target, "DescendantAdded")
-				descendant.Changed:Connect(function(property: string)
-					makeDirty(target, property)
-				end)
-				descendant.AttributeChanged:Connect(function(attribute: string): ()
-					makeDirty(target, "AttributeChanged")
-				end)
-			end)
-			for _, descendant in target:GetDescendants() do
-				descendant.Changed:Connect(function(property: string): ()
-					makeDirty(target, property)
-				end)
-				descendant.AttributeChanged:Connect(function(attribute: string): ()
-					makeDirty(target, "AttributeChanged")
-				end)
-			end
-		end
-
-		-- Clear on destruction
-		target.Destroying:Connect(function()
-			changedFiles[target] = nil
-			updateChangedFilesUI()
-		end)
-
-		changedFiles[target] = false
-	end
+	listenForChanges(target, data)
 end
 
 function buildPath(path: string): ()
@@ -1103,6 +1111,8 @@ function buildAll()
 		buildPath(path)
 	end
 end
+
+--offline-end
 
 function setConnected(newConnected: boolean)
 	if connecting then return end

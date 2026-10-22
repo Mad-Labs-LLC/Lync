@@ -64,6 +64,7 @@ try {
 		AutoUpdate_Repo: 'Mad-Labs-LLC/Lync',
 		AutoUpdate_LatestId: 0,
 		Path_RobloxPlugins: '',
+		Path_Lune: 'lune',
 		JobCommands: {}
 	}
 	if (PLATFORM == 'windows') {
@@ -100,11 +101,12 @@ function argHelp(err) {
 ┃      CONFIG                Opens the config file.                                 ┃
 ┃      SERVE ${cyan('project.json', true)}?   Syncs the project.                                     ┃
 ┃      OPEN  ${cyan('project.json', true)}?   Builds, syncs, and opens the project in Roblox Studio. ┃
-┃      BUILD ${cyan('project.json', true)}?   Builds the project to file.                            ┃
+┃      BUILD ${cyan('project.json', true)}? ${cyan('output', true)}?   Builds the project to a place or model file.   ┃
 ┃      FETCH ${cyan('project.json', true)}?   Downloads the list of sources in the project file.     ┃
 ┣╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍┫
 ┃ ${cyan('project.json', true)}?   The project file to read from and serve.                          ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ 
+┃ ${cyan('output', true)}?         The file BUILD writes; .rbxl, .rbxlx, .rbxm, or .rbxmx.           ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 `)
 	process.exit(err && -1 || 0)
 }
@@ -123,7 +125,19 @@ if (MODE == '' || MODE == 'help') {
 }
 if (MODE != 'serve' && MODE != 'open' && MODE != 'build' && MODE != 'fetch') argHelp('Mode must be SERVE, OPEN, BUILD, or FETCH')
 if (MODE == 'open' && PLATFORM != 'windows' && PLATFORM != 'macos') argHelp('Cannot use OPEN mode on Linux')
-const PROJECT_JSON = ARGS[1] && ARGS[1].replace(/\\/g, '/') || 'default.project.json'
+const BUILD_EXTENSIONS = ['.rbxl', '.rbxlx', '.rbxm', '.rbxmx']
+let projectJsonArg = ARGS[1]
+let buildOutputArg = ARGS[2]
+// BUILD takes an optional output file after the project file; a project file is never named like one, so `lync build out.rbxl` works too
+if (MODE == 'build' && projectJsonArg && BUILD_EXTENSIONS.includes(path.extname(projectJsonArg).toLowerCase())) {
+	buildOutputArg = projectJsonArg
+	projectJsonArg = undefined
+}
+// Resolve now, before Lync moves into the project folder, so a relative output lands where the command was run, as with Rojo
+if (buildOutputArg) buildOutputArg = path.resolve(buildOutputArg)
+let PROJECT_JSON = projectJsonArg && projectJsonArg.replace(/\\/g, '/') || 'default.project.json'
+// A project folder stands for the default.project.json inside it, as with Rojo
+if (fs.existsSync(PROJECT_JSON) && fs.statSync(PROJECT_JSON).isDirectory()) PROJECT_JSON = PROJECT_JSON.replace(/\/+$/, '') + '/default.project.json'
 
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // Globals
@@ -185,7 +199,8 @@ function localPathIsIgnored(localPath) {
 async function getAsync(url, headers, responseType) {
 	const newHeaders = { 'user-agent': 'node.js' }
 	for (const header in headers) {
-		newHeaders[header] = headers[header]
+		// Callers pass `false` for an unset Authorization; sending the literal word gets the request rejected
+		if (headers[header]) newHeaders[header] = headers[header]
 	}
 	return new Promise ((resolve, reject) => {
 		const req = https.get(url, {
@@ -557,7 +572,8 @@ async function mapDirectory(localPath, robloxPath, flag) {
 			}
 
 			if (flag != 'Modified') {
-				fs.readdirSync(localPath).forEach(async function(dirNext) {
+				// Awaited in sequence so the map is complete when this returns; BUILD snapshots it right after the initial mapping
+				for (const dirNext of fs.readdirSync(localPath)) {
 					const dirNextLower = dirNext.toLowerCase()
 					const localPathParentNameLower = localPathParentName.toLowerCase()
 					// Do not map Init files. They were just mapped on this run of mapDirectory.
@@ -574,7 +590,7 @@ async function mapDirectory(localPath, robloxPath, flag) {
 							const filePathNext = localPath + '/' + dirNext
 							await mapDirectory(filePathNext, robloxPath + '/' + dirNext)
 					}
-				})
+				}
 			}
 		}
 	}
@@ -699,6 +715,22 @@ async function mapJsonRecursive(jsonPath, target, robloxPath, key, firstLoadingE
 					}
 				} catch (err) {
 					console.error(red('Failed to download package'), green(localPath.package) + red(':'), yellow(err))
+
+					// Fall back to the newest version downloaded earlier so an offline or rate-limited run still maps the package
+					if (tag == 'latest' && fs.existsSync(assetFolder)) {
+						let newest;
+						for (const entry of fs.readdirSync(assetFolder)) {
+							const entryPath = assetFolder + '/' + entry
+							const entryStats = fs.statSync(entryPath)
+							const isVersion = assetExt != '' ? entry.endsWith(assetExt) : entryStats.isDirectory() && !entry.endsWith('-unzipped')
+							if (isVersion && (!newest || entryStats.mtimeMs > newest.mtimeMs)) newest = { name: entry, mtimeMs: entryStats.mtimeMs }
+						}
+						if (newest) {
+							tag = assetExt != '' ? newest.name.slice(0, -assetExt.length) : newest.name
+							assetFile = assetFolder + `/${tag}`
+							console.log(yellow('Using previously downloaded'), green(localPath.package + '@' + tag))
+						}
+					}
 				}
 				map.tree[nextRobloxPath].Path.package = assetFile
 				if (fs.existsSync(assetFile + assetExt)) {
@@ -726,6 +758,7 @@ async function changedJson() {
 		process.exit()
 	}
 	process.chdir(path.resolve(PROJECT_JSON, '..'))
+	PROJECT_JSON = path.basename(PROJECT_JSON) // every later path is relative to the project folder, including the map entries the watcher compares against
 	if (MODE != 'serve' && MODE != 'open' && MODE != 'build') return
 	let globIgnorePathsArr = [
 		PROJECT_JSON,
@@ -785,6 +818,76 @@ function runJobs(event, localPath) {
 			}
 		}
 	}
+}
+
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Build Functions
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Builds the mapped project to a place or model file. The plugin's own build functions run inside Lune against a blank DataModel and
+ * pull every file through this server's Source endpoint, so a build takes the same path as a Studio sync; Lune then serializes the
+ * DataModel with the rbx-dom serializer Rojo uses.
+ * @param {number} port
+ */
+function build(port) {
+	const outputPath = path.resolve(buildOutputArg || projectJson.build || (projectJson.name || path.parse(process.cwd()).name) + '.rbxl')
+	const outputExt = path.parse(outputPath).ext.toLowerCase()
+	if (!BUILD_EXTENSIONS.includes(outputExt)) {
+		console.error(red('Build error:'), yellow('Output file must end in .rbxl, .rbxlx, .rbxm, or .rbxmx:'), cyan(outputPath))
+		process.exit(1)
+	}
+
+	// Extract the plugin's build functions; Lune's Luau has no `const`, so declare those locals the classic way
+	const pluginSourcePath = path.resolve(__dirname, 'RobloxPluginSource/Plugin.luau')
+	const pluginSource = fs.readFileSync(pluginSourcePath, { encoding: 'utf8' })
+	const offlineStart = pluginSource.indexOf('--offline-start')
+	const offlineEnd = pluginSource.indexOf('--offline-end')
+	if (offlineStart == -1 || offlineEnd == -1) {
+		console.error(red('Lync bug:'), yellow('Plugin source is missing the offline markers'), cyan(pluginSourcePath))
+		process.exit(1)
+	}
+	const buildFunctions = pluginSource.slice(offlineStart + '--offline-start'.length, offlineEnd).replace(/^(\s*)const(\s)/gm, '$1local$2')
+
+	// Write the build script and its inputs to a temporary folder
+	const template = fs.readFileSync(path.resolve(__dirname, 'luneBuildTemplate.luau'), { encoding: 'utf8' })
+	const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lync-build-'))
+	const buildScriptPath = path.join(buildDir, 'build.luau')
+	const buildConfigPath = path.join(buildDir, 'build.json')
+	fs.writeFileSync(buildScriptPath, template.replace('--lync-plugin-source', () => buildFunctions))
+	fs.writeFileSync(buildConfigPath, JSON.stringify({ Port: port, Output: outputPath, Map: map }))
+	fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+	if (DEBUG) console.log('Wrote build script to', cyan(buildDir))
+
+	// Run Lune
+	const lunePath = PLATFORM == 'windows' && CONFIG.Path_Lune.replace('%LOCALAPPDATA%', process.env.LOCALAPPDATA)
+		|| PLATFORM == 'macos' && CONFIG.Path_Lune.replace('$HOME', process.env.HOME)
+		|| CONFIG.Path_Lune
+	console.log('Building', cyan(outputPath), '. . .')
+	const startTime = Date.now()
+	const cleanup = () => {
+		if (!DEBUG) fs.rmSync(buildDir, { force: true, recursive: true })
+	}
+	spawn(lunePath, ['run', buildScriptPath, buildConfigPath], {
+		cwd: process.cwd(),
+		stdio: 'inherit',
+		windowsHide: true
+	})
+	.on('error', (err) => {
+		cleanup()
+		console.error(red('Build error:'), yellow('Could not run Lune'), `(${cyan(lunePath, true)}):`, yellow(err.message))
+		console.error(yellow('Install Lune (https://lune-org.github.io/docs) or set'), green('Path_Lune'), yellow('in'), cyan(CONFIG_PATH))
+		process.exit(1)
+	})
+	.on('close', (status) => {
+		cleanup()
+		if (status != 0) {
+			console.error(red('Build failed'), yellow(`(Lune exited with status ${status})`))
+			process.exit(status || 1)
+		}
+		console.log('Built', cyan(outputPath), 'in', (Date.now() - startTime) / 1000, 'seconds')
+		process.exit()
+	})
 }
 
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -920,12 +1023,6 @@ async function fetchSources() {
 	}
 
 	console.log()
-	
-	// Build
-	if (MODE == 'build') {
-		console.error(red('Build error:'), yellow('Unimplemented'))
-		process.exit(1)
-	}
 
 	// Open place
 	if (MODE == 'open') {
@@ -1088,7 +1185,7 @@ async function fetchSources() {
 
 	// Start server
 
-	http.createServer(function(req, res) {
+	const server = http.createServer(function(req, res) {
 		if (MODE != 'build') {
 			if (securityKey == null) {
 				if (!('key' in req.headers)) {
@@ -1324,7 +1421,15 @@ async function fetchSources() {
 		console.error(red('Terminated: Server error:'), err)
 		process.exit()
 	})
-	.listen(projectJson.port, function() {
-		if (MODE != 'build') console.log(`Serving ${green(projectJson.name || path.parse(process.cwd()).name)} on port ${yellow(projectJson.port)}`)
-	})
+
+	if (MODE == 'build') {
+		// Only the local Lune process talks to a build server, so take any free port rather than collide with a SERVE of the same project
+		server.listen(0, '127.0.0.1', function() {
+			build(server.address().port)
+		})
+	} else {
+		server.listen(projectJson.port, function() {
+			console.log(`Serving ${green(projectJson.name || path.parse(process.cwd()).name)} on port ${yellow(projectJson.port)}`)
+		})
+	}
 })()

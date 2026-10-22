@@ -3,5 +3,5 @@
 
 # To add a new tool, add an entry to this table.
 [tools]
-lune = "filiptibell/lune@0.8.0"
+lune = "lune-org/lune@0.11.1"
 rbxcloud = "Sleitnick/rbxcloud@0.6.1"

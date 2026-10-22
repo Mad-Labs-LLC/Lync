@@ -1,5 +1,6 @@
 {
 	"name": "Example Build",
+	"build": "BuildScripts/Build/Build.rbxl",
 	"port": 34873,
 	"experienceId": 4785810464,
 	"placeId": 13796132659,

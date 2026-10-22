@@ -121,6 +121,19 @@ module.exports.validate = function(type, json, localPath) {
 			failed = true
 		}
 
+		if ('build' in json) {
+			if (typeof json.build != 'string') {
+				console.error(jsonError(localPath, json, json, 'build'), yellow('Must be a string'))
+				failed = true
+			} else {
+				const pathExt = path.parse(json.build).ext.toLowerCase()
+				if (pathExt != '.rbxl' && pathExt != '.rbxlx' && pathExt != '.rbxm' && pathExt != '.rbxmx') {
+					console.error(jsonError(localPath, json, json, 'build'), yellow('Must point to an RBXL, RBXLX, RBXM, or RBXMX file'))
+					failed = true
+				}
+			}
+		}
+
 		if (('collisionGroups' in json) && typeof json.collisionGroups != 'string') {
 			console.error(jsonError(localPath, json, json, 'collisionGroups'), yellow('Must be a string'))
 			failed = true
