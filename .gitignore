@@ -2,8 +2,10 @@ desktop.ini
 .DS_Store
 *.lock
 ~$*
+*.rbxm
+*.rbxl
 Lync/lync-*
-Sample Project/.lync-packages/*
-Sample Project/BuildScripts/Build/*
-!Sample Project/BuildScripts/Build/.gitkeep
-Sample Project/sourcemap.json
+Sample/.lync-packages/*
+Sample/BuildScripts/Build/*
+!Sample/BuildScripts/Build/.gitkeep
+Sample/sourcemap.json
