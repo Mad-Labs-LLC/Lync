@@ -145,19 +145,44 @@ local CollectionService = {
 	end;
 }
 
--- Lune cannot register collision groups (Workspace.CollisionGroupData is opaque to it), so pretend every group exists and say so once
-local collisionGroupsWarned = false
+-- Studio keeps collision groups in Workspace.CollisionGroupData: a version byte (1), a group count, then per group its id, the byte 4,
+-- a little-endian u32 mask in which bit i means "collides with group id i", a name length and the name. Default is always id 0 and
+-- every pair collides until told otherwise. Verified byte for byte against a place Studio saved. The plugin drives this through the
+-- same three PhysicsService calls it makes in Studio, and the build writes the encoded property once the tree is done.
+local collisionGroupNames = { "Default" } -- index - 1 is the group id
+local collisionGroupIds = { Default = 0 }
+local collisionGroupMasks = { 0xFFFFFFFF }
 local PhysicsService = {
-	IsCollisionGroupRegistered = function(): boolean
-		if not collisionGroupsWarned then
-			collisionGroupsWarned = true
-			unsupported(`Collision groups ({map.info.CollisionGroupsFile})`)
-		end
-		return true
+	IsCollisionGroupRegistered = function(_, name: string): boolean
+		return collisionGroupIds[name] ~= nil
 	end;
-	RegisterCollisionGroup = function() end;
-	CollisionGroupSetCollidable = function() end;
+	RegisterCollisionGroup = function(_, name: string)
+		if collisionGroupIds[name] then return end
+		if #collisionGroupNames >= 32 then error("Roblox allows at most 32 collision groups", 0) end
+		if #name == 0 or #name > 255 then error(`Collision group name "{name}" must be 1 to 255 bytes`, 0) end
+		table.insert(collisionGroupNames, name)
+		table.insert(collisionGroupMasks, 0xFFFFFFFF)
+		collisionGroupIds[name] = #collisionGroupNames - 1
+	end;
+	CollisionGroupSetCollidable = function(_, nameA: string, nameB: string, collidable: boolean)
+		local idA, idB = collisionGroupIds[nameA], collisionGroupIds[nameB]
+		if not idA then error(`Collision group "{nameA}" is not registered`, 0) end
+		if not idB then error(`Collision group "{nameB}" is not registered`, 0) end
+		for id, otherId in { [idA] = idB, [idB] = idA } do
+			local bit = bit32.lshift(1, otherId)
+			local mask = collisionGroupMasks[id + 1]
+			collisionGroupMasks[id + 1] = if collidable then bit32.bor(mask, bit) else bit32.band(mask, bit32.bnot(bit))
+		end
+	end;
 }
+
+local function encodeCollisionGroupData(): string
+	local out = { string.char(1, #collisionGroupNames) }
+	for index, name in collisionGroupNames do
+		table.insert(out, string.char(index - 1, 4) .. string.pack("<I4", collisionGroupMasks[index]) .. string.char(#name) .. name)
+	end
+	return table.concat(out)
+end
 
 -- `eval` validates property strings against a strict grammar before they get here; this environment is what they can name
 local LOADSTRING_ENVIRONMENT = {
@@ -259,6 +284,10 @@ for _, scheduled in scheduledAfterSync do
 	task.spawn(scheduled.Func, unpack(scheduled.Args))
 end
 table.clear(scheduledAfterSync)
+
+if map.info.CollisionGroups then
+	workspace.CollisionGroupData = encodeCollisionGroupData()
+end
 
 -- Studio would otherwise create a second camera next to the one the project built
 local camera = workspace:FindFirstChildOfClass("Camera")
