@@ -18,7 +18,7 @@
 	Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
 	USA
 */
-const VERSION = 'Alpha 30'
+const VERSION = 'Alpha 31'
 
 const { execSync, spawn, spawnSync } = require('child_process')
 const crypto = require('crypto')

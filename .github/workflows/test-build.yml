@@ -7,7 +7,7 @@ on:
     paths:
     - '.github/workflows/test-build.yml'
     - 'Lync/**'
-    - 'Sample Project/**'
+    - 'Sample/**'
 
 jobs:
   test-build:
@@ -20,7 +20,7 @@ jobs:
     - name: Extract Sample Project
       run: |
         mv Lync/ ../LyncBinaries/
-        mv "Sample Project/" ../temp/
+        mv Sample/ ../temp/
         rm -r *
         mv -v ../temp/* ./
 

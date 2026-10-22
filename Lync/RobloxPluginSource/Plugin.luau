@@ -21,7 +21,7 @@
 	Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
 	USA
 ]]
-const VERSION = "Alpha 30"
+const VERSION = "Alpha 31"
 
 if not plugin or game:GetService("RunService"):IsRunning() and game:GetService("RunService"):IsClient() then return end
 
