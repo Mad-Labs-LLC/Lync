@@ -9,3 +9,4 @@ Sample/.lync-packages/*
 Sample/BuildScripts/Build/*
 !Sample/BuildScripts/Build/.gitkeep
 Sample/sourcemap.json
+Lync/node_modules/

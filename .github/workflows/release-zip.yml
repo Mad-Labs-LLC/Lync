@@ -10,13 +10,17 @@ jobs:
     steps:
 
     - name: Download repository
-      uses: actions/checkout@master
+      uses: actions/checkout@v4
 
     - name: Install Node
-      uses: actions/setup-node@main
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
 
-    - name: Install pkg
+    - name: Install dependencies and pkg
       run: |
+        cd Lync
+        npm ci
         npm install -g pkg
 
     - name: Compile Lync

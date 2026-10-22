@@ -12,6 +12,8 @@ rm -f lync-win-x64.exe \
       lync-linux-x64 \
       lync-linux-arm64
 
+npm ci
+
 pkg package.json --no-bytecode --public-packages "*" --public --targets node18-win-x64,node18-macos-arm64,node18-macos-x64,node18-linux-arm64,node18-linux-x64
 
 echo "Build complete"

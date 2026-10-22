@@ -9,7 +9,7 @@
 		"fzstd": "^0.1.0",
 		"lua-json": "^1.0.1",
 		"lz4js": "^0.2.0",
-		"node-watch": "^0.7.3",
+		"picomatch": "^2.3.1",
 		"toml": "^3.0.0",
 		"xlsx": "https://cdn.sheetjs.com/xlsx-0.20.0/xlsx-0.20.0.tgz",
 		"xml-js": "^1.6.11",
@@ -17,7 +17,11 @@
 	},
 	"pkg": {
 		"scripts": "./index.js",
-		"assets": [ "./Plugin.rbxm", "./luneBuildTemplate.luau", "./RobloxPluginSource/Plugin.luau" ],
+		"assets": [
+			"./Plugin.rbxm",
+			"./luneBuildTemplate.luau",
+			"./RobloxPluginSource/Plugin.luau"
+		],
 		"targets": [
 			"node18-win",
 			"node18-macos",
