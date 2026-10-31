@@ -46,7 +46,10 @@ const TweenService = game:GetService("TweenService")
 
 -- Constants
 const IS_PLAYTEST_SERVER = if RunService:IsRunning() then "true" else nil
-const TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE = 500 -- Team Create sessions cap plugin HttpService calls at this rate; local edit sessions are uncapped
+const TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE = 500 -- Team Create sessions cap plugin HttpService calls at this rate
+const HTTP_LIMIT_ERROR = "Number of requests exceeded limit" -- What HttpService throws once Studio's rolling per-minute plugin request budget is spent
+const HTTP_LIMIT_RETRY_SECONDS = 5
+const HTTP_LIMIT_GIVE_UP_SECONDS = 90 -- Longer than the 60 second window, so a request only fails if the budget never refills
 const SYNC_REQUEST_TYPES = {Lua = true, Model = true, JSON = true, YAML = true, TOML = true, Excel = true, JsonModel = true, PlainText = true, Localization = true}
 const SUPPRESSED_CLASSES = {
 	"Terrain";
@@ -98,6 +101,7 @@ local map: {
 	tree: any;
 };
 local activeSourceRequests = 0
+local httpLimited = false
 const updatingSource: {[LuaSourceContainer]: true?} = setmetatable({}, {__mode = "k"}) :: any
 const tagsChangedLocks: {[Instance]: true?} = setmetatable({}, {__mode = "k"}) :: any
 const changedFiles: {[Instance]: boolean?} = setmetatable({}, {__mode = "k"}) :: any
@@ -130,6 +134,43 @@ const unsavedFilesFrame = widgetFrame.UnsavedFiles
 
 function getHost(): string
 	return "http://localhost:" .. (portTextBox.Text ~= "" and portTextBox.Text or portTextBox.PlaceholderText)
+end
+
+-- Studio refuses plugin HttpService calls past its rolling per-minute budget, local edit sessions included. A full sync of a large project
+-- spends the whole budget in one burst, so the request after it (the first Modified poll) used to be refused and disconnect the session.
+-- Every call to the Lync server goes through these, and a refused request waits for the budget to refill and retries. Other errors propagate.
+function withHttpLimitRetry(func: () -> any): any
+	const giveUpAt = os.clock() + HTTP_LIMIT_GIVE_UP_SECONDS
+	while true do
+		const success, result = pcall(func)
+		if success then
+			if httpLimited then
+				httpLimited = false
+				print("[Lync] - Studio's HTTP request budget refilled, resuming")
+			end
+			return result
+		elseif string.find(tostring(result), HTTP_LIMIT_ERROR, 1, true) and os.clock() < giveUpAt then
+			if not httpLimited then
+				httpLimited = true
+				warn(`[Lync] - Studio's plugin HTTP request budget is spent for this minute; waiting for it to refill instead of disconnecting`)
+			end
+			task.wait(HTTP_LIMIT_RETRY_SECONDS)
+		else
+			error(result, 0)
+		end
+	end
+end
+
+function lyncGet(headers: {[string]: any}): string
+	return withHttpLimitRetry(function()
+		return HttpService:GetAsync(getHost(), false, headers)
+	end)
+end
+
+function lyncRequest(options: {[string]: any}): any
+	return withHttpLimitRetry(function()
+		return HttpService:RequestAsync(options)
+	end)
 end
 
 -- Team Create sessions expose the connected editors as Players in the edit DataModel; a local edit session has no LocalPlayer
@@ -336,7 +377,7 @@ function addChangedFileEntry(object: (Instance | "CollisionGroupData"), path: st
 							const data = map.tree[path]
 							const success, result = pcall(function()
 								if data.Type == "Lua" then
-									const source = HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+									const source = lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 									setScriptSourceLive(data.Instance, source)
 								elseif data.Type == "Model" then
 									buildPath(path)
@@ -391,9 +432,9 @@ function addChangedFileEntry(object: (Instance | "CollisionGroupData"), path: st
 							const data = map.tree[path]
 							const success, result = pcall(function()
 								if data.Type == "Lua" then
-									HttpService:RequestAsync({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = ScriptEditorService:GetEditorSource(data.Instance), Compress = Enum.HttpCompression.None})
+									lyncRequest({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = ScriptEditorService:GetEditorSource(data.Instance), Compress = Enum.HttpCompression.None})
 								elseif data.Type == "Model" then
-									HttpService:RequestAsync({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = buffer.tostring(SerializationService:SerializeInstancesAsync({object})), Compress = Enum.HttpCompression.None})
+									lyncRequest({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = data.Path}, Body = buffer.tostring(SerializationService:SerializeInstancesAsync({object})), Compress = Enum.HttpCompression.None})
 								end
 							end)
 							if success then
@@ -405,7 +446,7 @@ function addChangedFileEntry(object: (Instance | "CollisionGroupData"), path: st
 						elseif object == "CollisionGroupData" then
 							const currentCollisionGroups = getCurrentCollisionGroups()
 							const success, result = pcall(function()
-								HttpService:RequestAsync({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = map.info.CollisionGroupsFile}, Body = HttpService:JSONEncode(currentCollisionGroups), Compress = Enum.HttpCompression.None})
+								lyncRequest({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "ReverseSync", Path = map.info.CollisionGroupsFile}, Body = HttpService:JSONEncode(currentCollisionGroups), Compress = Enum.HttpCompression.None})
 							end)
 							if success then
 								map.info.CollisionGroups = currentCollisionGroups
@@ -923,7 +964,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -938,7 +979,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -968,7 +1009,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -983,7 +1024,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -1014,7 +1055,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -1035,7 +1076,7 @@ function buildPath(path: string): ()
 			task.spawn(function(): ()
 				activeSourceRequests += 1
 				const success, result = pcall(function()
-					return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
 				activeSourceRequests -= 1
 				if success then
@@ -1057,7 +1098,7 @@ function buildPath(path: string): ()
 				task.spawn(function(): ()
 					activeSourceRequests += 1
 					const success, result = pcall(function()
-						return HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Source", Path = data.TerrainRegion[1], DataType = data.Type})
+						return lyncGet({Key = serverKey, Type = "Source", Path = data.TerrainRegion[1], DataType = data.Type})
 					end)
 					activeSourceRequests -= 1
 					if success then
@@ -1136,7 +1177,7 @@ function setConnected(newConnected: boolean)
 		if newConnected then
 			if not map then
 				const success, result = pcall(function()
-					return HttpService:JSONDecode(HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER}))
+					return HttpService:JSONDecode(lyncGet({Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER}))
 				end)
 				if success then
 					if result.info.Version == VERSION and not blocksTeamCreateSync(result.tree) then
@@ -1162,7 +1203,7 @@ function setConnected(newConnected: boolean)
 				end
 			else
 				const success, result = pcall(function()
-					HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Resume"})
+					lyncGet({Key = serverKey, Type = "Resume"})
 				end)
 				if not success then
 					task.spawn(error, "[Lync] - " .. result)
@@ -1385,7 +1426,7 @@ end)
 while task.wait(0.5) do
 	if connected then
 		const success, result = pcall(function()
-			const get = HttpService:GetAsync(getHost(), false, {Key = serverKey, Type = "Modified", Playtest = IS_PLAYTEST_SERVER})
+			const get = lyncGet({Key = serverKey, Type = "Modified", Playtest = IS_PLAYTEST_SERVER})
 			return get ~= "{}" and HttpService:JSONDecode(get) or nil
 		end)
 		if success then
