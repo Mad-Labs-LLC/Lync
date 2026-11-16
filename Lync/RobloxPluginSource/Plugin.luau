@@ -46,6 +46,9 @@ const TweenService = game:GetService("TweenService")
 
 -- Constants
 const IS_PLAYTEST_SERVER = if RunService:IsRunning() then "true" else nil
+const SDRP_DEV_EXPERIENCE = 10235505216
+const SDRP_DEV_PLACE = 118009146607971
+const SDRP_DEV_PORT = 34877
 const TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE = 500 -- Team Create sessions cap plugin HttpService calls at this rate
 const HTTP_LIMIT_ERROR = "Number of requests exceeded limit" -- What HttpService throws once Studio's rolling per-minute plugin request budget is spent
 const HTTP_LIMIT_RETRY_SECONDS = 5
@@ -90,11 +93,16 @@ const BUTTON_TWEEN_PROPERTIES = {Offset = Vector2.new(0.51, 0)}
 local theme: StudioTheme = settings().Studio.Theme :: StudioTheme
 local connected = false
 local connecting = false
+local autoPaused = false
 local serverKey = plugin:GetSetting("Lync_ServerKey")
 local map: {
 	info: {
 		Version: number;
 		Debug: boolean;
+		ExperienceId: number?;
+		PlaceId: number?;
+		SessionId: string?;
+		Revision: number?;
 		CollisionGroupsFile: string;
 		CollisionGroups: {[string]: {[string]: boolean}};
 	};
@@ -1155,6 +1163,22 @@ end
 
 --offline-end
 
+function isSdrpDev(): boolean
+	return not IS_PLAYTEST_SERVER and game.GameId == SDRP_DEV_EXPERIENCE and game.PlaceId == SDRP_DEV_PLACE
+end
+
+function matchesPlace(info): boolean
+	return info.ExperienceId == game.GameId and info.PlaceId == game.PlaceId
+end
+
+function hasUnsavedChanges(): boolean
+	if changedCollisionGroupData then return true end
+	for _, changed in changedFiles do
+		if changed then return true end
+	end
+	return false
+end
+
 function setConnected(newConnected: boolean)
 	if connecting then return end
 
@@ -1177,10 +1201,10 @@ function setConnected(newConnected: boolean)
 		if newConnected then
 			if not map then
 				const success, result = pcall(function()
-					return HttpService:JSONDecode(lyncGet({Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER}))
+					return HttpService:JSONDecode(lyncGet({Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER, LaneCursor = "1"}))
 				end)
 				if success then
-					if result.info.Version == VERSION and not blocksTeamCreateSync(result.tree) then
+					if result.info.Version == VERSION and (not isSdrpDev() or matchesPlace(result.info)) and not blocksTeamCreateSync(result.tree) then
 						map = result
 						if not IS_PLAYTEST_SERVER then
 							if result.info.Debug then warn("[Lync] - Map:", result) end
@@ -1192,8 +1216,11 @@ function setConnected(newConnected: boolean)
 							table.clear(scheduledAfterSync)
 						end
 					else
+						autoPaused = true
 						if result.info.Version ~= VERSION then
 							task.spawn(error, `[Lync] - Version mismatch ({result.info.Version} ~= {VERSION}). Please restart Studio`)
+						elseif isSdrpDev() and not matchesPlace(result.info) then
+							warn("[Lync] - The server does not identify this project as SDRP Dev.")
 						end
 						newConnected = false
 					end
@@ -1203,6 +1230,17 @@ function setConnected(newConnected: boolean)
 				end
 			else
 				const success, result = pcall(function()
+					if map.info.SessionId then
+						const info = HttpService:JSONDecode(lyncGet({Type = "ProjectInfo"}))
+						if info.SessionId ~= map.info.SessionId then
+							if hasUnsavedChanges() then
+								autoPaused = true
+								error("The Lync server restarted. Save or discard pending Studio changes before syncing again.")
+							end
+							map = nil
+							error("The Lync server restarted. A fresh sync is required.")
+						end
+					end
 					lyncGet({Key = serverKey, Type = "Resume"})
 				end)
 				if not success then
@@ -1251,6 +1289,8 @@ if not IS_PLAYTEST_SERVER then
 	-- Connect
 	do
 		connect.Activated:Connect(function()
+			if connecting then return end
+			autoPaused = connected
 			setConnected(not connected)
 		end)
 
@@ -1370,7 +1410,9 @@ if not IS_PLAYTEST_SERVER and workspace:GetAttribute("__lync_active") then
 	workspace:SetAttribute("__lync_active", nil)
 end
 
-if workspace:GetAttribute("__lync_port") and (not IS_PLAYTEST_SERVER or syncDuringTest  and workspace:GetAttribute("__lync_active")) then
+if isSdrpDev() then
+	portTextBox.Text = tostring(SDRP_DEV_PORT)
+elseif workspace:GetAttribute("__lync_port") and (not IS_PLAYTEST_SERVER or syncDuringTest  and workspace:GetAttribute("__lync_active")) then
 	if syncDuringTest and IS_PLAYTEST_SERVER then warn("[Lync] - Playtest Sync is active.") end
 	if workspace:GetAttribute("__lync_port") then
 		assert(type(workspace:GetAttribute("__lync_port")) == "number", `Attribute "workspace.__lync_port" must be a number`)
@@ -1381,6 +1423,23 @@ if workspace:GetAttribute("__lync_port") and (not IS_PLAYTEST_SERVER or syncDuri
 	end
 	setConnected(true)
 end
+
+-- IDs can arrive after plugins start in a published place. Retry discovery while the local server starts.
+task.spawn(function()
+	if IS_PLAYTEST_SERVER then return end
+	while game.PlaceId == 0 or game.GameId == 0 do task.wait(2) end
+	if not isSdrpDev() then return end
+	portTextBox.Text = tostring(SDRP_DEV_PORT)
+	while true do
+		if not connected and not connecting and not autoPaused then
+			const ok, info = pcall(function()
+				return HttpService:JSONDecode(lyncGet({Type = "ProjectInfo"}))
+			end)
+			if ok and matchesPlace(info) and not autoPaused then setConnected(true) end
+		end
+		task.wait(5)
+	end
+end)
 
 RunService.Heartbeat:Connect(function(_dt: number)
 	if connected and map.info.CollisionGroups then
@@ -1426,6 +1485,13 @@ end)
 while task.wait(0.5) do
 	if connected then
 		const success, result = pcall(function()
+			if map.info.SessionId then
+				const response = HttpService:JSONDecode(lyncGet({
+					Key = serverKey, Type = "ModifiedSince", Session = map.info.SessionId, Revision = tostring(map.info.Revision),
+				}))
+				map.info.Revision = response.Revision
+				return if next(response.Changes) then response.Changes else nil
+			end
 			const get = lyncGet({Key = serverKey, Type = "Modified", Playtest = IS_PLAYTEST_SERVER})
 			return get ~= "{}" and HttpService:JSONDecode(get) or nil
 		end)

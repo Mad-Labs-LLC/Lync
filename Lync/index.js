@@ -57,6 +57,7 @@ let CONFIG;
 try {
 	CONFIG = {
 		Debug: false,
+		BindHost: '',
 		GenerateSourcemap: true,
 		GithubAccessToken: '',
 		AutoUpdate: false,
@@ -149,6 +150,13 @@ var firstMapped = false
 var map = { info: {}, tree: {} }
 var modified = {}
 var modified_playtest = {}
+// Modern clients each keep their own cursor. One window polling must never drain another window's edits.
+const sessionId = crypto.randomUUID()
+const pathRevisions = new Map()
+let revision = 0
+function recordChange(robloxPath) {
+	if (firstMapped) pathRevisions.set(robloxPath, ++revision)
+}
 var modified_sourcemap = {}
 var projectJson;
 var globIgnorePathsPicoMatch;
@@ -266,6 +274,7 @@ function assignMap(robloxPath, mapDetails, mtimeMs) {
 		}
 	}
 	map.tree[robloxPath] = mapDetails
+	recordChange(robloxPath)
 	modified[robloxPath] = mapDetails
 	modified_playtest[robloxPath] = mapDetails
 	modified_sourcemap[robloxPath] = mapDetails
@@ -777,6 +786,9 @@ async function changedJson() {
 
 	map = { info: {}, tree: {} }
 	map.info.Version = VERSION
+	map.info.SessionId = sessionId
+	map.info.ExperienceId = projectJson.experienceId
+	map.info.PlaceId = projectJson.placeId
 	map.info.Debug = DEBUG
 	if ('collisionGroups' in projectJson) {
 		const collisionGroupsPath = path.relative(process.cwd(), projectJson.collisionGroups).replace(/\\/g, '/')
@@ -1078,6 +1090,7 @@ async function fetchSources() {
 									delete mTimes[map.tree[key].Path]
 									delete map.tree[key]
 									modified[key] = false
+								recordChange(key)
 									modified_playtest[key] = false
 									modified_sourcemap[key] = false
 								}
@@ -1186,6 +1199,12 @@ async function fetchSources() {
 	// Start server
 
 	const server = http.createServer(function(req, res) {
+		res.setHeader('Cache-Control', 'no-store')
+		if (req.headers.type === 'ProjectInfo' && MODE !== 'build') {
+			res.writeHead(200, { 'Content-Type': 'application/json' })
+			res.end(JSON.stringify({ ExperienceId: projectJson.experienceId, PlaceId: projectJson.placeId, SessionId: sessionId }))
+			return
+		}
 		if (MODE != 'build') {
 			if (securityKey == null) {
 				if (!('key' in req.headers)) {
@@ -1209,15 +1228,33 @@ async function fetchSources() {
 
 		switch (req.headers.type) {
 			case 'Map':
+				map.info.Revision = revision
 				const mapJsonString = JSON.stringify(map)
-				if ('playtest' in req.headers) {
-					modified_playtest = {}
-				} else {
-					modified = {}
+				if (!req.headers.lanecursor) {
+					if ('playtest' in req.headers) modified_playtest = {}
+					else modified = {}
 				}
 				res.writeHead(200)
 				res.end(mapJsonString)
 				break
+
+			case 'ModifiedSince': {
+				const since = Number(req.headers.revision)
+				if (req.headers.session !== sessionId || !Number.isSafeInteger(since) || since < 0 || since > revision) {
+					res.writeHead(409)
+					res.end('A fresh map is required')
+					break
+				}
+				const changes = {}
+				if (since !== revision) {
+					for (const [key, lastChange] of pathRevisions) {
+						if (lastChange > since) changes[key] = map.tree[key] ?? false
+					}
+				}
+				res.writeHead(200)
+				res.end(JSON.stringify({ Revision: revision, Changes: changes }))
+				break
+			}
 
 			case 'Modified':
 				let modifiedJsonString;
@@ -1428,7 +1465,7 @@ async function fetchSources() {
 			build(server.address().port)
 		})
 	} else {
-		server.listen(projectJson.port, function() {
+		server.listen(projectJson.port, CONFIG.BindHost || undefined, function() {
 			console.log(`Serving ${green(projectJson.name || path.parse(process.cwd()).name)} on port ${yellow(projectJson.port)}`)
 		})
 	}
