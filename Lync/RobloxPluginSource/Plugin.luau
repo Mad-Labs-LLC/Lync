@@ -49,6 +49,7 @@ const IS_PLAYTEST_SERVER = if RunService:IsRunning() then "true" else nil
 const SDRP_DEV_EXPERIENCE = 10235505216
 const SDRP_DEV_PLACE = 118009146607971
 const SDRP_DEV_PORT = 34877
+const MAX_SOURCE_WORKERS = 16
 const TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE = 500 -- Team Create sessions cap plugin HttpService calls at this rate
 const HTTP_LIMIT_ERROR = "Number of requests exceeded limit" -- What HttpService throws once Studio's rolling per-minute plugin request budget is spent
 const HTTP_LIMIT_RETRY_SECONDS = 5
@@ -109,6 +110,7 @@ local map: {
 	tree: any;
 };
 local activeSourceRequests = 0
+local sourceWorkers = 0
 local httpLimited = false
 const updatingSource: {[LuaSourceContainer]: true?} = setmetatable({}, {__mode = "k"}) :: any
 const tagsChangedLocks: {[Instance]: true?} = setmetatable({}, {__mode = "k"}) :: any
@@ -270,9 +272,10 @@ end
 
 function getCurrentCollisionGroups(): {[string]: {[string]: boolean}}
 	const currentCollisionGroups = {}
-	for _, collisionGroup in PhysicsService:GetRegisteredCollisionGroups() do
+	const groups = PhysicsService:GetRegisteredCollisionGroups()
+	for _, collisionGroup in groups do
 		currentCollisionGroups[collisionGroup.name] = {}
-		for _, otherCollisionGroup in PhysicsService:GetRegisteredCollisionGroups() do
+		for _, otherCollisionGroup in groups do
 			if not currentCollisionGroups[otherCollisionGroup.name] or currentCollisionGroups[otherCollisionGroup.name][collisionGroup.name] == nil then
 				currentCollisionGroups[collisionGroup.name][otherCollisionGroup.name] = PhysicsService:CollisionGroupsAreCollidable(collisionGroup.name, otherCollisionGroup.name)
 			end
@@ -686,30 +689,29 @@ function listenForChanges(target: any, data: any): ()
 			end)
 
 		elseif mapType == "Model" then
+			-- Roblox passes the property name, so every descendant in this file can share these two closures.
+			const function propertyChanged(property)
+				makeDirty(target, property)
+			end
+			const function attributeChanged()
+				makeDirty(target, "AttributeChanged")
+			end
+			const function watchDescendant(descendant: Instance)
+				descendant.Changed:Connect(propertyChanged)
+				descendant.AttributeChanged:Connect(attributeChanged)
+			end
 			target.Changed:Connect(function(property: string): ()
 				if property ~= "Parent" then
 					makeDirty(target, property)
 				end
 			end)
-			target.AttributeChanged:Connect(function(attribute: string): ()
-				makeDirty(target, "AttributeChanged")
-			end)
+			target.AttributeChanged:Connect(attributeChanged)
 			target.DescendantAdded:Connect(function(descendant: Instance): ()
 				makeDirty(target, "DescendantAdded")
-				descendant.Changed:Connect(function(property: string)
-					makeDirty(target, property)
-				end)
-				descendant.AttributeChanged:Connect(function(attribute: string): ()
-					makeDirty(target, "AttributeChanged")
-				end)
+				watchDescendant(descendant)
 			end)
 			for _, descendant in target:GetDescendants() do
-				descendant.Changed:Connect(function(property: string): ()
-					makeDirty(target, property)
-				end)
-				descendant.AttributeChanged:Connect(function(attribute: string): ()
-					makeDirty(target, "AttributeChanged")
-				end)
+				watchDescendant(descendant)
 			end
 		end
 
@@ -725,6 +727,17 @@ end
 
 -- Everything between the offline markers is also run by `lync build` inside Lune (see luneBuildTemplate.luau), so it must only touch
 -- Instances, the map, and the helpers the template provides. Keep Studio-only APIs (signals, plugin, UI, services) outside the markers.
+-- Hold a slot through deserialization and installation, when both the response and the new instances are in memory.
+function spawnSourceTask(callback: () -> ())
+	while sourceWorkers >= MAX_SOURCE_WORKERS do task.wait() end
+	sourceWorkers += 1
+	task.spawn(function()
+		const ok, message = pcall(callback)
+		sourceWorkers -= 1
+		if not ok then error(message, 0) end
+	end)
+end
+
 --offline-start
 
 function scheduleAfterSync(func: () -> (), ...: any): ()
@@ -969,12 +982,10 @@ function buildPath(path: string): ()
 				newInstance.Parent = target
 				target = newInstance
 			end
-			task.spawn(function(): ()
-				activeSourceRequests += 1
+			spawnSourceTask(function(): ()
 				const success, result = pcall(function()
 					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
-				activeSourceRequests -= 1
 				if success then
 					setScriptSourceLive(target, result)
 					finishBuild(target, data)
@@ -984,12 +995,10 @@ function buildPath(path: string): ()
 			end)
 
 		elseif data.Type == "Model" then
-			task.spawn(function(): ()
-				activeSourceRequests += 1
+			spawnSourceTask(function(): ()
 				const success, result = pcall(function()
 					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
-				activeSourceRequests -= 1
 				if success then
 					const objects = deserialize(data.Path, result)
 					if objects then
@@ -1014,12 +1023,10 @@ function buildPath(path: string): ()
 				newInstance.Parent = target
 				target = newInstance
 			end
-			task.spawn(function(): ()
-				activeSourceRequests += 1
+			spawnSourceTask(function(): ()
 				const success, result = pcall(function()
 					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
-				activeSourceRequests -= 1
 				if success then
 					setScriptSourceLive(target, result)
 					finishBuild(target, data)
@@ -1029,12 +1036,10 @@ function buildPath(path: string): ()
 			end)
 
 		elseif data.Type == "JsonModel" then
-			task.spawn(function(): ()
-				activeSourceRequests += 1
+			spawnSourceTask(function(): ()
 				const success, result = pcall(function()
 					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
-				activeSourceRequests -= 1
 				if success then
 					const json = HttpService:JSONDecode(result)
 					if createInstance then
@@ -1060,12 +1065,10 @@ function buildPath(path: string): ()
 				newInstance.Parent = target
 				target = newInstance
 			end
-			task.spawn(function(): ()
-				activeSourceRequests += 1
+			spawnSourceTask(function(): ()
 				const success, result = pcall(function()
 					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
-				activeSourceRequests -= 1
 				if success then
 					target.Value = result
 					finishBuild(target, data)
@@ -1081,12 +1084,10 @@ function buildPath(path: string): ()
 				newInstance.Parent = target
 				target = newInstance
 			end
-			task.spawn(function(): ()
-				activeSourceRequests += 1
+			spawnSourceTask(function(): ()
 				const success, result = pcall(function()
 					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
 				end)
-				activeSourceRequests -= 1
 				if success then
 					lpcall("Set Entries", false, function()
 						target:SetEntries(HttpService:JSONDecode(result))
@@ -1103,12 +1104,10 @@ function buildPath(path: string): ()
 
 		if data.TerrainRegion then
 			if target == workspace.Terrain then
-				task.spawn(function(): ()
-					activeSourceRequests += 1
+				spawnSourceTask(function(): ()
 					const success, result = pcall(function()
 						return lyncGet({Key = serverKey, Type = "Source", Path = data.TerrainRegion[1], DataType = data.Type})
 					end)
-					activeSourceRequests -= 1
 					if success then
 						const objects = deserialize(data.TerrainRegion[1], result)
 						if objects then
@@ -1208,12 +1207,18 @@ function setConnected(newConnected: boolean)
 						map = result
 						if not IS_PLAYTEST_SERVER then
 							if result.info.Debug then warn("[Lync] - Map:", result) end
-							task.spawn(buildAll)
-							repeat task.wait() until activeSourceRequests == 0
+							const built, failure = pcall(buildAll)
+							repeat task.wait() until sourceWorkers == 0 and activeSourceRequests == 0
 							for _, scheduled in scheduledAfterSync do
 								task.spawn(scheduled.Func, unpack(scheduled.Args))
 							end
 							table.clear(scheduledAfterSync)
+							if not built then
+								newConnected = false
+								autoPaused = true
+								map = nil
+								warn("[Lync] - Initial sync failed:", failure)
+							end
 						end
 					else
 						autoPaused = true
@@ -1441,8 +1446,12 @@ task.spawn(function()
 	end
 end)
 
-RunService.Heartbeat:Connect(function(_dt: number)
+local lastCollisionCheck = 0
+RunService.Heartbeat:Connect(function()
 	if connected and map.info.CollisionGroups then
+		const now = os.clock()
+		if now - lastCollisionCheck < 0.5 then return end
+		lastCollisionCheck = now
 		local currentCollisionGroups = getCurrentCollisionGroups()
 
 		local dirty = false
@@ -1507,7 +1516,7 @@ while task.wait(0.5) do
 				for _, path in sortedPaths do
 					buildPath(path)
 				end
-				repeat task.wait() until activeSourceRequests == 0
+				repeat task.wait() until sourceWorkers == 0 and activeSourceRequests == 0
 				for _, scheduled in scheduledAfterSync do
 					task.spawn(scheduled.Func, unpack(scheduled.Args))
 				end

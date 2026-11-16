@@ -28,12 +28,10 @@ const path = require('path')
 const process = require('process')
 
 const chokidar = require('chokidar')
-const { parseCSV } = require('csv-load-sync')
 const extractZIP = require('extract-zip')
 const { http, https } = require('follow-redirects')
 const LUA = require('lua-json')
 const picomatch = require('picomatch')
-const XLSX = require('xlsx')
 
 const { red, yellow, green, cyan, fileError, jsonError } = require('./output.js')
 const { generateSourcemap } = require('./sourcemap/sourcemap.js')
@@ -148,14 +146,23 @@ const mTimes = {}
 var securityKey = null
 var firstMapped = false
 var map = { info: {}, tree: {} }
-var modified = {}
-var modified_playtest = {}
+let legacyEditRevision = -1
+let legacyPlaytestRevision = -1
 // Modern clients each keep their own cursor. One window polling must never drain another window's edits.
 const sessionId = crypto.randomUUID()
 const pathRevisions = new Map()
 let revision = 0
 function recordChange(robloxPath) {
 	if (firstMapped) pathRevisions.set(robloxPath, ++revision)
+}
+function changesSince(since) {
+	const changes = since === -1 ? { ...map.tree } : {}
+	if (since !== revision) {
+		for (const [key, lastChange] of pathRevisions) {
+			if (lastChange > since) changes[key] = map.tree[key] ?? false
+		}
+	}
+	return changes
 }
 var modified_sourcemap = {}
 var projectJson;
@@ -275,9 +282,7 @@ function assignMap(robloxPath, mapDetails, mtimeMs) {
 	}
 	map.tree[robloxPath] = mapDetails
 	recordChange(robloxPath)
-	modified[robloxPath] = mapDetails
-	modified_playtest[robloxPath] = mapDetails
-	modified_sourcemap[robloxPath] = mapDetails
+	if (firstMapped && CONFIG.GenerateSourcemap) modified_sourcemap[robloxPath] = mapDetails
 	if (localPath) mTimes[localPath] = mtimeMs
 	if (mapDetails.Meta) mTimes[mapDetails.Meta] = fs.statSync(mapDetails.Meta).mtimeMs // Meta File stats are never retrieved before this, so they aren't in a function parameter
 	if (mapDetails['TerrainRegion']) {
@@ -1089,10 +1094,8 @@ async function fetchSources() {
 									delete mTimes[localPath]
 									delete mTimes[map.tree[key].Path]
 									delete map.tree[key]
-									modified[key] = false
 								recordChange(key)
-									modified_playtest[key] = false
-									modified_sourcemap[key] = false
+								if (CONFIG.GenerateSourcemap) modified_sourcemap[key] = false
 								}
 
 								// Init
@@ -1231,8 +1234,8 @@ async function fetchSources() {
 				map.info.Revision = revision
 				const mapJsonString = JSON.stringify(map)
 				if (!req.headers.lanecursor) {
-					if ('playtest' in req.headers) modified_playtest = {}
-					else modified = {}
+					if ('playtest' in req.headers) legacyPlaytestRevision = revision
+					else legacyEditRevision = revision
 				}
 				res.writeHead(200)
 				res.end(mapJsonString)
@@ -1245,25 +1248,19 @@ async function fetchSources() {
 					res.end('A fresh map is required')
 					break
 				}
-				const changes = {}
-				if (since !== revision) {
-					for (const [key, lastChange] of pathRevisions) {
-						if (lastChange > since) changes[key] = map.tree[key] ?? false
-					}
-				}
 				res.writeHead(200)
-				res.end(JSON.stringify({ Revision: revision, Changes: changes }))
+				res.end(JSON.stringify({ Revision: revision, Changes: changesSince(since) }))
 				break
 			}
 
 			case 'Modified':
 				let modifiedJsonString;
 				if ('playtest' in req.headers) {
-					modifiedJsonString = JSON.stringify(modified_playtest)
-					modified_playtest = {}
+					modifiedJsonString = JSON.stringify(changesSince(legacyPlaytestRevision))
+					legacyPlaytestRevision = revision
 				} else {
-					modifiedJsonString = JSON.stringify(modified)
-					modified = {}
+					modifiedJsonString = JSON.stringify(changesSince(legacyEditRevision))
+					legacyEditRevision = revision
 				}
 				res.writeHead(200)
 				res.end(modifiedJsonString)
@@ -1271,6 +1268,17 @@ async function fetchSources() {
 
 			case 'Source':
 				try {
+					// Models and terrain pass through unchanged. Stream them with backpressure, even when several editors sync together.
+					if (req.headers.datatype === 'Model' || req.headers.datatype === 'Instance') {
+						const input = fs.createReadStream(req.headers.path)
+						res.on('close', () => input.destroy())
+						input.on('error', err => {
+							if (res.headersSent) res.destroy(err)
+							else { res.writeHead(500); res.end(err.toString()) }
+						})
+						input.pipe(res)
+						break
+					}
 					let read = fs.readFileSync(req.headers.path)
 
 					// Parse JSON
@@ -1297,6 +1305,7 @@ async function fetchSources() {
 							if (!fs.existsSync(excelFilePath)) {
 								console.error(fileError(excelFilePath), yellow('Excel file does not exist'))
 							} else {
+								const XLSX = require('xlsx')
 								const excelFile = XLSX.readFile(excelFilePath)
 
 								// Convert Excel 'Defined Name' to 'Ref'
@@ -1378,7 +1387,7 @@ async function fetchSources() {
 					// Convert Localization CSV to JSON
 					} else if (req.headers.datatype == 'Localization') {
 						let entries = []
-						const csv = parseCSV(read.toString('utf8'))
+						const csv = require('csv-load-sync').parseCSV(read.toString('utf8'))
 						for (let index = 0; index < csv.length; index++) {
 							const entry = csv[index]
 							const values = {}

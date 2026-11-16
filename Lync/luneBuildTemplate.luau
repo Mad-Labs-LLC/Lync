@@ -105,6 +105,8 @@ local task = {
 	wait = function() end;
 }
 
+local spawnSourceTask = task.spawn
+
 local function terminate(errorMessage: string)
 	error("[Lync] - " .. errorMessage, 0)
 end
@@ -214,6 +216,10 @@ end
 
 local function getHost(): string
 	return "http://127.0.0.1:" .. BUILD.Port
+end
+
+local function lyncGet(headers: {[string]: string}): string
+	return HttpService:GetAsync(getHost(), false, headers)
 end
 
 local function setScriptSourceLive(container, lua: string)
