@@ -164,6 +164,47 @@ function changesSince(since) {
 	}
 	return changes
 }
+// Scripts carry a content hash in the map, so a client can skip the ones it already holds. Matches sourceHash in Plugin.luau:
+// the byte length, then two 32-bit mixes over little-endian words and the tail bytes, of the file with carriage returns removed
+// (the plugin strips them before it writes a script).
+function sourceHash(bytes) {
+	let h1 = 0x811C9DC5, h2 = 0x9E3779B1
+	const words = bytes.length >>> 2
+	for (let index = 0; index < words; index++) {
+		const word = bytes.readUInt32LE(index * 4)
+		h1 = Math.imul(h1 ^ word, 0x01000193) >>> 0
+		h2 = Math.imul(((h2 << 5) | (h2 >>> 27)) ^ word, 0x85EBCA6B) >>> 0
+	}
+	for (let index = words * 4; index < bytes.length; index++) {
+		const byte = bytes[index]
+		h1 = Math.imul(h1 ^ byte, 0x01000193) >>> 0
+		h2 = Math.imul(((h2 << 5) | (h2 >>> 27)) ^ byte, 0x85EBCA6B) >>> 0
+	}
+	return `${bytes.length}:${h1.toString(16).padStart(8, '0')}:${h2.toString(16).padStart(8, '0')}`
+}
+const sourceHashCache = new Map()
+function addSourceHashes(tree) {
+	for (const key in tree) {
+		const entry = tree[key]
+		if (!entry || typeof entry.Path !== 'string' || (entry.Type !== 'Lua' && entry.Type !== 'Model')) continue
+		try {
+			const stat = fs.statSync(entry.Path)
+			entry.Size = stat.size // lets a client fill its batch requests by size
+			const stamp = `${stat.mtimeMs}:${stat.size}`
+			let cached = sourceHashCache.get(entry.Path)
+			if (!cached || cached.stamp !== stamp) {
+				const raw = fs.readFileSync(entry.Path)
+				// A script is hashed as the plugin stores it (no carriage returns); a model as the file is.
+				const bytes = entry.Type === 'Lua' && raw.includes(13) ? Buffer.from(raw.filter(byte => byte !== 13)) : raw
+				cached = { stamp, hash: sourceHash(bytes) }
+				sourceHashCache.set(entry.Path, cached)
+			}
+			entry.Hash = cached.hash
+		} catch (err) {
+			delete entry.Hash
+		}
+	}
+}
 var modified_sourcemap = {}
 var projectJson;
 var globIgnorePathsPicoMatch;
@@ -1232,6 +1273,8 @@ async function fetchSources() {
 		switch (req.headers.type) {
 			case 'Map':
 				map.info.Revision = revision
+				map.info.Batch = MODE != 'build' // this server answers SourceBatch
+				if (MODE != 'build') addSourceHashes(map.tree)
 				const mapJsonString = JSON.stringify(map)
 				if (!req.headers.lanecursor) {
 					if ('playtest' in req.headers) legacyPlaytestRevision = revision
@@ -1248,8 +1291,10 @@ async function fetchSources() {
 					res.end('A fresh map is required')
 					break
 				}
+				const changes = changesSince(since)
+				addSourceHashes(changes)
 				res.writeHead(200)
-				res.end(JSON.stringify({ Revision: revision, Changes: changesSince(since) }))
+				res.end(JSON.stringify({ Revision: revision, Changes: changes }))
 				break
 			}
 
@@ -1415,6 +1460,37 @@ async function fetchSources() {
 					res.end(err.toString())
 				}
 				break
+
+			case 'SourceBatch': {
+				// Many raw files in one response, so a client spends one request instead of one per file. Per file, in the order asked:
+				// a 4-byte little-endian length and the bytes. 0xFFFFFFFF marks a file that is outside the project or could not be read.
+				const received = []
+				req.on('data', chunk => received.push(chunk))
+				req.on('end', () => {
+					try {
+						const paths = JSON.parse(Buffer.concat(received).toString('utf8'))
+						if (!Array.isArray(paths) || paths.length > 256) throw new Error('Expected a list of at most 256 paths')
+						const projectDir = process.cwd()
+						res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+						for (const filePath of paths) {
+							let bytes = null
+							try {
+								if (typeof filePath == 'string' && path.resolve(filePath).substring(0, projectDir.length) == projectDir) bytes = fs.readFileSync(filePath)
+							} catch (err) {}
+							const length = Buffer.alloc(4)
+							length.writeUInt32LE(bytes ? bytes.length : 0xFFFFFFFF)
+							res.write(length)
+							if (bytes) res.write(bytes)
+						}
+						res.end()
+					} catch (err) {
+						console.error(red('Server error:'), err)
+						if (!res.headersSent) res.writeHead(400)
+						res.end(err.toString())
+					}
+				})
+				break
+			}
 
 			case 'ReverseSync':
 				const workingDir = process.cwd()

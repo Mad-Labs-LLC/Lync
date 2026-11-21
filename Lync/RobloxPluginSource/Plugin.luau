@@ -49,6 +49,13 @@ const IS_PLAYTEST_SERVER = if RunService:IsRunning() then "true" else nil
 const SDRP_DEV_EXPERIENCE = 10235505216
 const SDRP_DEV_PLACE = 118009146607971
 const SDRP_DEV_PORT = 34877
+const LANE_ATTRIBUTE = "SDRPLane" -- SDRP Autopilot sets this on the private test Studios ("lanes") it launches and fills itself
+const SYNCING_ATTRIBUTE = "__lync_syncing" -- On Workspace while a first sync is building, so other tools can wait for it
+const LAST_SYNC_ATTRIBUTE = "__lync_last_sync" -- On Workspace after connecting: what the first sync cost
+const PLUGIN_LOADED_AT = os.clock()
+const BATCH_MAX_BYTES = 4 * 1024 * 1024 -- One batch request carries at most this much (a single larger file travels alone)
+const BATCH_MAX_FILES = 64
+const MAX_BATCH_WORKERS = 3 -- Batches in flight at once, which bounds how many responses and new instances are in memory together
 const MAX_SOURCE_WORKERS = 16
 const TEAM_CREATE_HTTP_REQUESTS_PER_MINUTE = 500 -- Team Create sessions cap plugin HttpService calls at this rate
 const HTTP_LIMIT_ERROR = "Number of requests exceeded limit" -- What HttpService throws once Studio's rolling per-minute plugin request budget is spent
@@ -654,12 +661,117 @@ function lpcall(context: string, warning: boolean, func: any, ...): (boolean, an
 	end)
 end
 
+function deserializeBuffer(path: string, data: buffer): {Instance}?
+	const success, result = lpcall(`Deserialize "{path}"`, false, SerializationService.DeserializeInstancesAsync, SerializationService, data)
+	return if success then result else nil
+end
+
 function deserialize(path: string, data: string): {Instance}?
 	const success, result = lpcall(`Deserialize "{path}"`, false, SerializationService.DeserializeInstancesAsync, SerializationService, buffer.fromstring(data))
 	return if success then result else nil
 end
 
+-- Models are not imported again while the place still holds them exactly as Lync imported them. The record of that lives in the place
+-- (a StringValue in ServerStorage, one "file hash <tab> path" line per model) so it is there the next time the place is opened.
+-- A model leaves the record the moment Lync sees it change, move or go. The record is only believed when it was saved by a session
+-- in which every model was being watched ("Watched" attribute): a place saved without a completed sync is imported in full.
+-- Delete the StringValue to force everything to be imported again. Not available to `lync build`.
+const MANIFEST_NAME = "__lync_manifest"
+const MANIFEST_MAX_CHARS = 190000
+local manifest: {[string]: string} = {}
+local manifestUsable = false -- the record may be believed when deciding what to keep
+local manifestWatched = false -- a sync in this session finished, so every recorded model has change listeners
+local manifestWriteScheduled = false
+local stampPaths: {[Instance]: string} = {}
+local stampedAt: {[string]: Instance} = {}
+
+function findManifestObject(create: boolean): StringValue?
+	const serverStorage = game:GetService("ServerStorage")
+	local object = serverStorage:FindFirstChild(MANIFEST_NAME)
+	if object and not object:IsA("StringValue") then return nil end
+	if not object and create then
+		const created = Instance.new("StringValue")
+		created.Name = MANIFEST_NAME
+		created.Parent = serverStorage
+		object = created
+	end
+	return object :: StringValue?
+end
+
+function loadManifest(): ()
+	const object = findManifestObject(false)
+	if not object then return end
+	manifestUsable = object:GetAttribute("Watched") == true
+	if manifestUsable then
+		for hash, path in string.gmatch(object.Value, "([^\t\n]+)\t([^\n]+)") do
+			manifest[path] = hash
+		end
+		-- Until a sync in this session has put listeners on every model, a save of this place must not be believed.
+		object:SetAttribute("Watched", nil)
+	end
+end
+
+function writeManifest(): ()
+	manifestWriteScheduled = false
+	const object = findManifestObject(true)
+	if not object then return end
+	const entries = {}
+	local size = 0
+	for path, hash in manifest do
+		const entry = hash .. "\t" .. path
+		if size + #entry + 1 > MANIFEST_MAX_CHARS then break end
+		size += #entry + 1
+		table.insert(entries, entry)
+	end
+	object.Value = table.concat(entries, "\n")
+	object:SetAttribute("Watched", if manifestWatched then true else nil)
+end
+
+function scheduleManifestWrite(): ()
+	if manifestWriteScheduled or not manifestWatched then return end
+	manifestWriteScheduled = true
+	task.delay(1, writeManifest)
+end
+
+-- Whether the model at this path can stay: the record says it came from the very file the server now offers, and nothing has
+-- been seen to change it since.
+function keepModel(path: string, instance: Instance, entry: any): boolean
+	return manifestUsable and entry.Hash ~= nil and manifest[path] == entry.Hash and changedFiles[instance] ~= true
+end
+
+function stampModel(path: string, instance: Instance, hash: string?): ()
+	const previous = stampedAt[path]
+	if previous and previous ~= instance then stampPaths[previous] = nil end
+	stampedAt[path] = instance
+	stampPaths[instance] = path
+	manifest[path] = hash :: any
+	scheduleManifestWrite()
+end
+
+function unstampModel(instance: Instance): ()
+	const path = stampPaths[instance]
+	if not path then return end
+	stampPaths[instance] = nil
+	if stampedAt[path] == instance then
+		stampedAt[path] = nil
+		manifest[path] = nil
+		scheduleManifestWrite()
+	end
+end
+
+-- After a first sync that ran to the end: every model in the map is recorded and watched, so the record can be trusted from here on.
+function finishManifest(): ()
+	for path in manifest do
+		const entry = map.tree[path]
+		if not entry or entry.Type ~= "Model" or not stampedAt[path] then manifest[path] = nil end
+	end
+	manifestUsable = true
+	manifestWatched = true
+	writeManifest()
+end
+
 function makeDirty(object: Instance, property: string): ()
+	if stampPaths[object] and not table.find(SUPPRESSED_PROPERTIES, property) then unstampModel(object) end
 	if changedFiles[object] == false and object.Parent and not table.find(SUPPRESSED_PROPERTIES, property) then
 		if map.info.Debug then print("[Lync] - Modified synced object:", object, property) end
 		changedFiles[object] = true
@@ -703,6 +815,8 @@ function listenForChanges(target: any, data: any): ()
 			target.Changed:Connect(function(property: string): ()
 				if property ~= "Parent" then
 					makeDirty(target, property)
+				else
+					unstampModel(target) -- moved or removed: whatever sits at its path next is not what was recorded
 				end
 			end)
 			target.AttributeChanged:Connect(attributeChanged)
@@ -717,6 +831,7 @@ function listenForChanges(target: any, data: any): ()
 
 		-- Clear on destruction
 		target.Destroying:Connect(function()
+			unstampModel(target)
 			changedFiles[target] = nil
 			updateChangedFilesUI()
 		end)
@@ -728,6 +843,89 @@ end
 -- Everything between the offline markers is also run by `lync build` inside Lune (see luneBuildTemplate.luau), so it must only touch
 -- Instances, the map, and the helpers the template provides. Keep Studio-only APIs (signals, plugin, UI, services) outside the markers.
 -- Hold a slot through deserialization and installation, when both the response and the new instances are in memory.
+-- What the current first sync has done so far. Not available to `lync build`, so offline code checks it exists.
+local syncStats = {unchanged = 0, fetched = 0}
+
+-- Files waiting to be fetched together. Studio completes only a few dozen HttpService calls a second however small they are, so one
+-- request per file made a first sync spend most of its time waiting on requests. Not available to `lync build`.
+local sourceQueue: {any} = {}
+local sourceQueueScheduled = false
+local batchWorkers = 0
+
+-- One request for a list of files. The response is, per file and in order, a 4-byte little-endian length and the bytes; 0xFFFFFFFF
+-- marks a file the server would not send. Any file that does not arrive is handed on as nil and fetched on its own.
+function processBatch(batch: {any}): ()
+	const paths = table.create(#batch)
+	for index, item in batch do
+		paths[index] = item.Data.Path
+	end
+	const fetchStarted = os.clock()
+	const success, response = pcall(function()
+		return lyncRequest({Url = getHost(), Method = "POST", Headers = {Key = serverKey, Type = "SourceBatch"}, Body = HttpService:JSONEncode(paths)})
+	end)
+	if syncStats then syncStats.batchFetch = (syncStats.batchFetch or 0) + (os.clock() - fetchStarted) end
+	if syncStats then syncStats.batches = (syncStats.batches or 0) + (1) end
+	local body: buffer? = if success and response.Success then buffer.fromstring(response.Body) else nil
+	local offset = 0
+	for _, item in batch do
+		local bytes: buffer? = nil
+		if body and offset + 4 <= buffer.len(body) then
+			const length = buffer.readu32(body, offset)
+			offset += 4
+			if length ~= 0xFFFFFFFF then
+				if offset + length <= buffer.len(body) then
+					bytes = buffer.create(length)
+					buffer.copy(bytes, 0, body, offset, length)
+					offset += length
+				else
+					body = nil -- cut short: the rest are fetched one by one
+				end
+			end
+		else
+			body = nil
+		end
+		const ok, message = pcall(item.Install, bytes)
+		if not ok then task.spawn(error, message, 0) end
+	end
+end
+
+function flushSourceQueue(): ()
+	sourceQueueScheduled = false
+	const queued = sourceQueue
+	sourceQueue = {}
+	const function send(items: {any}): ()
+		sourceWorkers += 1 -- counted at once, so the sync is never seen as idle while files are still waiting
+		task.spawn(function()
+			while batchWorkers >= MAX_BATCH_WORKERS do task.wait() end
+			batchWorkers += 1
+			const ok, message = pcall(processBatch, items)
+			batchWorkers -= 1
+			sourceWorkers -= 1
+			if not ok then error(message, 0) end
+		end)
+	end
+	local batch, batchBytes = {}, 0
+	for _, item in queued do
+		const size = item.Data.Size or 0
+		if #batch > 0 and (#batch >= BATCH_MAX_FILES or batchBytes + size > BATCH_MAX_BYTES) then
+			send(batch)
+			batch, batchBytes = {}, 0
+		end
+		table.insert(batch, item)
+		batchBytes += size
+	end
+	if #batch > 0 then send(batch) end
+end
+
+-- Queue a file for the next batch. Everything queued before the running code next yields goes out together.
+function queueSource(item: any): ()
+	table.insert(sourceQueue, item)
+	if not sourceQueueScheduled then
+		sourceQueueScheduled = true
+		task.defer(flushSourceQueue)
+	end
+end
+
 function spawnSourceTask(callback: () -> ())
 	while sourceWorkers >= MAX_SOURCE_WORKERS do task.wait() end
 	sourceWorkers += 1
@@ -900,9 +1098,75 @@ function finishBuild(target: any, data: any): ()
 	listenForChanges(target, data)
 end
 
+-- Clears a "clear on sync" container down to what the map rebuilds in place: for every mapped name, the one child buildPath will
+-- find, when it is a script of the right class or a plain container of the right class. Everything else is destroyed, at every depth,
+-- exactly as a full clear would have removed it. Models are always destroyed: they are re-imported whole.
+function pruneUnmapped(target: Instance, path: string): ()
+	for _, child in target:GetChildren() do
+		const childPath = path .. "/" .. child.Name
+		const entry = map.tree[childPath]
+		local keep, whole = false, false
+		if entry and target:FindFirstChild(child.Name) == child then
+			if entry.Type == "Lua" then
+				keep = child.ClassName == (if entry.Context == "ModuleScript" then "ModuleScript" elseif entry.Context == "LocalScript" then "LocalScript" else "Script")
+			elseif entry.Type == "Instance" then
+				keep = child.ClassName == entry.ClassName
+			elseif entry.Type == "Model" then
+				keep = keepModel ~= nil and keepModel(childPath, child, entry)
+				whole = keep -- nothing inside a model is in the map
+			end
+		end
+		if child.Name == "__lync_manifest" and child.ClassName == "StringValue" then
+			keep, whole = true, true -- Lync's own record of what this place holds
+		end
+		if keep then
+			if not whole then pruneUnmapped(child, childPath) end
+		else
+			pcall(child.Destroy, child)
+		end
+	end
+end
+
+-- Matches sourceHash in index.js: the byte length, then two 32-bit mixes over little-endian words and the tail bytes.
+function sourceHash(source: string): string
+	const length = #source
+	const data = buffer.fromstring(source)
+	local h1, h2 = 0x811C9DC5, 0x9E3779B1
+	const words = length // 4
+	for index = 0, length - 1 - (length % 4), 4 do
+		const word = buffer.readu32(data, index)
+		h1 = bit32.bxor(h1, word)
+		h1 = ((h1 % 65536) * 0x01000193 + (((h1 // 65536) * 0x01000193) % 65536) * 65536) % 4294967296
+		h2 = bit32.bxor(bit32.lrotate(h2, 5), word)
+		h2 = ((h2 % 65536) * 0x85EBCA6B + (((h2 // 65536) * 0x85EBCA6B) % 65536) * 65536) % 4294967296
+	end
+	for index = words * 4, length - 1 do
+		const byte = buffer.readu8(data, index)
+		h1 = bit32.bxor(h1, byte)
+		h1 = ((h1 % 65536) * 0x01000193 + (((h1 // 65536) * 0x01000193) % 65536) * 65536) % 4294967296
+		h2 = bit32.bxor(bit32.lrotate(h2, 5), byte)
+		h2 = ((h2 % 65536) * 0x85EBCA6B + (((h2 // 65536) * 0x85EBCA6B) % 65536) * 65536) % 4294967296
+	end
+	return string.format("%d:%08x:%08x", length, h1, h2)
+end
+
+-- True when the script already holds exactly what the server would send. The length is checked first, so most changed files never get hashed.
+function sourceMatches(container: any, hash: string): boolean
+	const ok, source = pcall(function(): string
+		return container.Source
+	end)
+	if not ok or type(source) ~= "string" then return false end
+	if tonumber(string.match(hash, "^(%d+):")) ~= #source then return false end
+	const hashStarted = os.clock()
+	const same = sourceHash(source) == hash
+	if syncStats then syncStats.hash = (syncStats.hash or 0) + (os.clock() - hashStarted) end
+	return same
+end
+
 function buildPath(path: string): ()
 	const data = map.tree[path]
 	local createInstance = false
+	local keptModel = false
 	local target: any = game
 	const subpaths = path:split("/")
 	const name = subpaths[#subpaths]
@@ -914,9 +1178,10 @@ function buildPath(path: string): ()
 			target = game:GetService(subpath :: any)
 		elseif nextTarget then
 			if target ~= game and index == #subpaths then
+				if data and data.Type == "Model" and keepModel and keepModel(path, nextTarget, data) then keptModel = true end
 				if
 					not data
-					or data.Type == "Model" or data.Type == "JsonModel"
+					or data.Type == "Model" and not keptModel or data.Type == "JsonModel"
 					or data.Type == "Instance" and nextTarget.ClassName ~= data.ClassName
 					or data.Type == "Lua" and nextTarget.ClassName ~= (if data.Context == "ModuleScript" then "ModuleScript" elseif data.Context == "LocalScript" then "LocalScript" else "Script")
 				then
@@ -961,9 +1226,11 @@ function buildPath(path: string): ()
 		end
 
 		if data.ClearOnSync and not createInstance then
-			for _, child in target:GetChildren() do
-				pcall(child.Destroy, child)
-			end
+			-- Remove what the project does not put back. A script or plain container that is rebuilt in place is kept, so an unchanged
+			-- script is compared by hash instead of being deleted and fetched again.
+			const pruneStarted = os.clock()
+			pruneUnmapped(target, path)
+			if syncStats then syncStats.prune = (syncStats.prune or 0) + (os.clock() - pruneStarted) end
 		end
 
 		if data.Type == "Instance" then
@@ -982,39 +1249,87 @@ function buildPath(path: string): ()
 				newInstance.Parent = target
 				target = newInstance
 			end
-			spawnSourceTask(function(): ()
-				const success, result = pcall(function()
-					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
-				end)
-				if success then
-					setScriptSourceLive(target, result)
+			-- An unchanged script costs one hash instead of a request and an editor update.
+			if data.Hash and not createInstance and sourceMatches(target, data.Hash) then
+				if syncStats then syncStats.unchanged += 1 end
+				finishBuild(target, data)
+			else
+				const function install(bytes: buffer?): ()
+					local source: string? = if bytes then buffer.tostring(bytes) else nil
+					if not source then
+						const success, result = pcall(function()
+							return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+						end)
+						if not success then
+							terminate(`The server did not return a source for "{data.Path}"`)
+							return
+						end
+						source = result
+					end
+					if syncStats then syncStats.fetched += 1 end
+					setScriptSourceLive(target, source :: string)
 					finishBuild(target, data)
-				else
-					terminate(`The server did not return a source for "{data.Path}"`)
 				end
-			end)
+				if queueSource and map.info.Batch then
+					queueSource({Data = data, Install = install})
+				else
+					spawnSourceTask(function(): ()
+						install(nil)
+					end)
+				end
+			end
+
+		elseif data.Type == "Model" and keptModel then
+			-- Unchanged since Lync imported it: left in place, watched again.
+			if syncStats then syncStats.modelsKept = (syncStats.modelsKept or 0) + 1 end
+			finishBuild(target, data)
+			if stampModel then stampModel(path, target, data.Hash) end
 
 		elseif data.Type == "Model" then
-			spawnSourceTask(function(): ()
-				const success, result = pcall(function()
-					return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
-				end)
-				if success then
-					const objects = deserialize(data.Path, result)
-					if objects then
-						if #objects == 1 then
-							objects[1].Name = name
-							objects[1].Parent = target
-							target = objects[1]
-							finishBuild(target, data)
-						else
-							terminate(`"{data.Path}" cannot contain zero or multiple root Instances`)
-						end
-					end
+			const function install(bytes: buffer?): ()
+				local objects: {Instance}? = nil
+				if bytes then
+					const loadStarted = os.clock()
+					objects = deserializeBuffer(data.Path, bytes)
+					if syncStats then syncStats.modelLoad = (syncStats.modelLoad or 0) + (os.clock() - loadStarted) end
 				else
-					terminate(`The server did not return a source for "{data.Path}"`)
+					const fetchStarted = os.clock()
+					const success, result = pcall(function()
+						return lyncGet({Key = serverKey, Type = "Source", Path = data.Path, DataType = data.Type})
+					end)
+					if syncStats then syncStats.modelFetch = (syncStats.modelFetch or 0) + (os.clock() - fetchStarted) end
+					if not success then
+						terminate(`The server did not return a source for "{data.Path}"`)
+						return
+					end
+					const loadStarted = os.clock()
+					objects = deserialize(data.Path, result)
+					if syncStats then syncStats.modelLoad = (syncStats.modelLoad or 0) + (os.clock() - loadStarted) end
 				end
-			end)
+				if objects then
+					if #objects == 1 then
+						const parentStarted = os.clock()
+						objects[1].Name = name
+						objects[1].Parent = target
+						if syncStats then syncStats.modelParent = (syncStats.modelParent or 0) + (os.clock() - parentStarted) end
+						const watchStarted = os.clock()
+						target = objects[1]
+						finishBuild(target, data)
+						if stampModel then stampModel(path, target, data.Hash) end
+						if syncStats then syncStats.modelWatch = (syncStats.modelWatch or 0) + (os.clock() - watchStarted) end
+						if syncStats then syncStats.models = (syncStats.models or 0) + (1) end
+					else
+						terminate(`"{data.Path}" cannot contain zero or multiple root Instances`)
+					end
+				end
+			end
+			if queueSource and map.info.Batch then
+				queueSource({Data = data, Install = install})
+			else
+				spawnSourceTask(function(): ()
+					install(nil)
+				end)
+			end
 
 		elseif data.Type == "JSON" or data.Type == "YAML" or data.Type == "TOML" or data.Type == "Excel" then
 			if createInstance then
@@ -1105,6 +1420,7 @@ function buildPath(path: string): ()
 		if data.TerrainRegion then
 			if target == workspace.Terrain then
 				spawnSourceTask(function(): ()
+					const terrainStarted = os.clock()
 					const success, result = pcall(function()
 						return lyncGet({Key = serverKey, Type = "Source", Path = data.TerrainRegion[1], DataType = data.Type})
 					end)
@@ -1113,8 +1429,11 @@ function buildPath(path: string): ()
 						if objects then
 							if #objects == 1 then
 								lpcall("Set Terrain Region", false, function()
+									if syncStats then syncStats.terrainLoad = (syncStats.terrainLoad or 0) + (os.clock() - terrainStarted) end
+									const pasteStarted = os.clock()
 									workspace.Terrain:Clear()
 									workspace.Terrain:PasteRegion(objects[1] :: TerrainRegion, eval(data.TerrainRegion[2]), data.TerrainRegion[3])
+									if syncStats then syncStats.terrainPaste = (syncStats.terrainPaste or 0) + (os.clock() - pasteStarted) end
 								end)
 							else
 								terminate(`"{data.TerrainRegion[1]}" cannot contain zero or multiple root Instances`)
@@ -1166,6 +1485,29 @@ function isSdrpDev(): boolean
 	return not IS_PLAYTEST_SERVER and game.GameId == SDRP_DEV_EXPERIENCE and game.PlaceId == SDRP_DEV_PLACE
 end
 
+-- SDRP Autopilot marks the private test Studios it launches ("lanes") and fills each one itself with the exact commit under test.
+-- A lane still connects and follows the server, but it never builds from the served checkout: that would overwrite the code being tested.
+function isManagedLane(): boolean
+	return isSdrpDev() and workspace:GetAttribute(LANE_ATTRIBUTE) ~= nil
+end
+
+-- buildAll for a live Studio. Returns false when the Studio was claimed as a lane part-way; the lane owner then replaces everything.
+function buildAllLive(): boolean
+	if map.info.CollisionGroups then
+		setCollisionGroups()
+	end
+	const sortedPaths = {}
+	for path in map.tree do
+		table.insert(sortedPaths, path)
+	end
+	table.sort(sortedPaths)
+	for _, path in sortedPaths do
+		if isManagedLane() then return false end
+		buildPath(path)
+	end
+	return true
+end
+
 function matchesPlace(info): boolean
 	return info.ExperienceId == game.GameId and info.PlaceId == game.PlaceId
 end
@@ -1198,6 +1540,7 @@ function setConnected(newConnected: boolean)
 		end)
 
 		if newConnected then
+			const mapStarted = os.clock()
 			if not map then
 				const success, result = pcall(function()
 					return HttpService:JSONDecode(lyncGet({Key = serverKey, Type = "Map", Playtest = IS_PLAYTEST_SERVER, LaneCursor = "1"}))
@@ -1207,12 +1550,43 @@ function setConnected(newConnected: boolean)
 						map = result
 						if not IS_PLAYTEST_SERVER then
 							if result.info.Debug then warn("[Lync] - Map:", result) end
-							const built, failure = pcall(buildAll)
-							repeat task.wait() until sourceWorkers == 0 and activeSourceRequests == 0
-							for _, scheduled in scheduledAfterSync do
-								task.spawn(scheduled.Func, unpack(scheduled.Args))
+							local built, failure = true, nil
+							if isManagedLane() then
+								print("[Lync] - This Studio is an SDRP Autopilot lane: connected without syncing.")
+								workspace:SetAttribute(LAST_SYNC_ATTRIBUTE, "lane: connected without syncing")
+							else
+								workspace:SetAttribute(SYNCING_ATTRIBUTE, true)
+								table.clear(syncStats)
+								syncStats.unchanged, syncStats.fetched = 0, 0
+								const syncStarted = os.clock()
+								syncStats.map = syncStarted - mapStarted
+								syncStats.startup = mapStarted - PLUGIN_LOADED_AT
+								const ok, finished = pcall(buildAllLive)
+								built = ok
+								if not ok then failure = finished end
+								repeat task.wait() until sourceWorkers == 0 and activeSourceRequests == 0
+								if ok and finished then
+									for _, scheduled in scheduledAfterSync do
+										task.spawn(scheduled.Func, unpack(scheduled.Args))
+									end
+									finishManifest()
+								elseif ok then
+									print("[Lync] - This Studio became an SDRP Autopilot lane during the first sync: stopped syncing.")
+								end
+								table.clear(scheduledAfterSync)
+								workspace:SetAttribute(SYNCING_ATTRIBUTE, nil)
+								const buildSeconds = os.clock() - syncStarted
+								const function secs(key: string): string
+									return string.format("%.1f", syncStats[key] or 0)
+								end
+								const summary = `{syncStats.unchanged} scripts unchanged, {syncStats.fetched} fetched, {math.round(buildSeconds)} s{if ok and finished then "" elseif ok then ", stopped: became a lane" else ", failed"}`
+									.. ` | connect began {secs("startup")}s after the plugin loaded, map {secs("map")}s, clear {secs("prune")}s, hashing {secs("hash")}s`
+									.. `, {syncStats.models or 0} models imported and {syncStats.modelsKept or 0} kept (worker seconds: fetch {secs("modelFetch")}, load {secs("modelLoad")}, parent {secs("modelParent")}, watch {secs("modelWatch")})`
+									.. `, terrain load {secs("terrainLoad")}s paste {secs("terrainPaste")}s`
+									.. `, {syncStats.batches or 0} batch requests ({secs("batchFetch")} worker seconds waiting)`
+								print("[Lync] - First sync: " .. summary)
+								workspace:SetAttribute(LAST_SYNC_ATTRIBUTE, summary)
 							end
-							table.clear(scheduledAfterSync)
 							if not built then
 								newConnected = false
 								autoPaused = true
@@ -1429,10 +1803,14 @@ elseif workspace:GetAttribute("__lync_port") and (not IS_PLAYTEST_SERVER or sync
 	setConnected(true)
 end
 
+if not IS_PLAYTEST_SERVER then
+	pcall(loadManifest)
+end
+
 -- IDs can arrive after plugins start in a published place. Retry discovery while the local server starts.
 task.spawn(function()
 	if IS_PLAYTEST_SERVER then return end
-	while game.PlaceId == 0 or game.GameId == 0 do task.wait(2) end
+	while game.PlaceId == 0 or game.GameId == 0 do task.wait(0.1) end
 	if not isSdrpDev() then return end
 	portTextBox.Text = tostring(SDRP_DEV_PORT)
 	while true do
@@ -1512,16 +1890,19 @@ while task.wait(0.5) do
 					map.tree[key] = value or nil
 					table.insert(sortedPaths, key)
 				end
-				table.sort(sortedPaths)
-				for _, path in sortedPaths do
-					buildPath(path)
+				-- A lane keeps its cursor current but applies nothing: its contents belong to the commit under test.
+				if not isManagedLane() then
+					table.sort(sortedPaths)
+					for _, path in sortedPaths do
+						buildPath(path)
+					end
+					repeat task.wait() until sourceWorkers == 0 and activeSourceRequests == 0
+					for _, scheduled in scheduledAfterSync do
+						task.spawn(scheduled.Func, unpack(scheduled.Args))
+					end
+					table.clear(scheduledAfterSync)
+					ChangeHistoryService:SetWaypoint("Sync")
 				end
-				repeat task.wait() until sourceWorkers == 0 and activeSourceRequests == 0
-				for _, scheduled in scheduledAfterSync do
-					task.spawn(scheduled.Func, unpack(scheduled.Args))
-				end
-				table.clear(scheduledAfterSync)
-				ChangeHistoryService:SetWaypoint("Sync")
 			end
 		else
 			task.spawn(error, "[Lync] - " .. result)
