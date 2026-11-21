@@ -494,7 +494,19 @@ function addChangedFileEntry(object: (Instance | "CollisionGroupData"), path: st
 	end
 end
 
+-- Any number of changes in one burst cost one refresh. (Refreshing on every change, with a scan of every entry and of the whole
+-- map each time, locked Studio up when a few thousand scripts changed at once.)
+local changedFilesUpdateScheduled = false
 function updateChangedFilesUI(): ()
+	if changedFilesUpdateScheduled then return end
+	changedFilesUpdateScheduled = true
+	task.defer(function(): ()
+		changedFilesUpdateScheduled = false
+		updateChangedFilesUINow()
+	end)
+end
+
+function updateChangedFilesUINow(): ()
 	local anyChanged = false
 
 	-- Destroy hidden or old entries
@@ -510,6 +522,15 @@ function updateChangedFilesUI(): ()
 		end
 	end
 
+	const existingEntries: {[any]: boolean} = {}
+	for _, fileEntry in unsavedFilesFrame:GetChildren() do
+		if fileEntry:IsA("Frame") then
+			const holder: any = fileEntry:FindFirstChild("Instance")
+			if holder then existingEntries[holder.Value] = true end
+		end
+	end
+	local pathOf: {[any]: string}? = nil
+
 	-- Make new entries
 	for object, changed in changedFiles do
 		if not changed then continue end
@@ -517,22 +538,22 @@ function updateChangedFilesUI(): ()
 		anyChanged = true
 
 		-- Skip if entry already created
-		local alreadyCreated = false
-		for _, fileEntry in unsavedFilesFrame:GetChildren() do
-			if fileEntry:IsA("Frame") and fileEntry.Instance.Value == object then
-				alreadyCreated = true
-				break
-			end
-		end
-		if alreadyCreated then
+		if existingEntries[object] then
 			continue
 		end
 
-		for path in map.tree do
-			if map.tree[path].Instance == object then
-				addChangedFileEntry(object, path)
-				break
+		if not pathOf then
+			const index: {[any]: string} = {}
+			if map then
+				for path, data in map.tree do
+					if data.Instance then index[data.Instance] = path end
+				end
 			end
+			pathOf = index
+		end
+		const path = (pathOf :: {[any]: string})[object]
+		if path then
+			addChangedFileEntry(object, path)
 		end
 	end
 
@@ -676,6 +697,10 @@ end
 -- A model leaves the record the moment Lync sees it change, move or go. The record is only believed when it was saved by a session
 -- in which every model was being watched ("Watched" attribute): a place saved without a completed sync is imported in full.
 -- Delete the StringValue to force everything to be imported again. Not available to `lync build`.
+-- True while this Studio is an SDRP Autopilot lane. A lane's contents are written by Autopilot, so nothing in it is an unsaved edit:
+-- change listeners left by a sync that finished before the lane was claimed must do nothing.
+local laneClaimed = false
+
 const MANIFEST_NAME = "__lync_manifest"
 const MANIFEST_MAX_CHARS = 190000
 local manifest: {[string]: string} = {}
@@ -771,6 +796,7 @@ function finishManifest(): ()
 end
 
 function makeDirty(object: Instance, property: string): ()
+	if laneClaimed then return end
 	if stampPaths[object] and not table.find(SUPPRESSED_PROPERTIES, property) then unstampModel(object) end
 	if changedFiles[object] == false and object.Parent and not table.find(SUPPRESSED_PROPERTIES, property) then
 		if map.info.Debug then print("[Lync] - Modified synced object:", object, property) end
@@ -1807,10 +1833,28 @@ if not IS_PLAYTEST_SERVER then
 	pcall(loadManifest)
 end
 
+function refreshLaneClaim(): ()
+	const claimed = isManagedLane()
+	if claimed and not laneClaimed then
+		laneClaimed = true
+		for object, changed in changedFiles do
+			if changed then changedFiles[object] = false end
+		end
+		updateChangedFilesUI()
+	elseif not claimed then
+		laneClaimed = false
+	end
+end
+if not IS_PLAYTEST_SERVER then
+	workspace:GetAttributeChangedSignal(LANE_ATTRIBUTE):Connect(refreshLaneClaim)
+	refreshLaneClaim()
+end
+
 -- IDs can arrive after plugins start in a published place. Retry discovery while the local server starts.
 task.spawn(function()
 	if IS_PLAYTEST_SERVER then return end
 	while game.PlaceId == 0 or game.GameId == 0 do task.wait(0.1) end
+	refreshLaneClaim() -- the IDs that identify SDRP Dev have only now arrived
 	if not isSdrpDev() then return end
 	portTextBox.Text = tostring(SDRP_DEV_PORT)
 	while true do
